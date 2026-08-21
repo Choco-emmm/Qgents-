@@ -1,25 +1,6 @@
 name: qgents-production
 
 services:
-  mysql:
-    image: mysql:8.4
-    restart: unless-stopped
-    environment:
-      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?Set MYSQL_ROOT_PASSWORD}
-      MYSQL_DATABASE: qgents
-      MYSQL_USER: qgents
-      MYSQL_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD}
-    volumes:
-      - mysql_data:/var/lib/mysql
-      - ./src/main/resources/db/qgents_schema.sql:/docker-entrypoint-initdb.d/01-qgents-schema.sql:ro
-      - ./deploy/mysql/01-create-worker-db.sql:/docker-entrypoint-initdb.d/02-worker-db.sql:ro
-    networks: [backend]
-    healthcheck:
-      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u root -p$$MYSQL_ROOT_PASSWORD --silent"]
-      interval: 10s
-      timeout: 5s
-      retries: 20
-
   redis:
     image: redis:7-alpine
     restart: unless-stopped
@@ -60,7 +41,7 @@ services:
       dockerfile: sandbox-worker/Dockerfile.production
     restart: unless-stopped
     environment:
-      SANDBOX_DB_URL: jdbc:mysql://mysql:3306/qgents_sandbox_worker?useUnicode=true&characterEncoding=utf8&serverTimezone=UTC
+      SANDBOX_DB_URL: jdbc:mysql://${DB_HOST:-host.docker.internal}:${DB_PORT:-3306}/qgents_sandbox_worker?useUnicode=true&characterEncoding=utf8&serverTimezone=UTC
       SANDBOX_DB_USERNAME: qgents
       SANDBOX_DB_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD}
       SANDBOX_RUNTIME: docker
@@ -75,7 +56,7 @@ services:
       SANDBOX_WORKER_ID: production-worker-1
       HTTP_PROXY: http://clash:7890
       HTTPS_PROXY: http://clash:7890
-      NO_PROXY: localhost,127.0.0.1,mysql,redis,api,sandbox-worker,clash
+      NO_PROXY: localhost,127.0.0.1,host.docker.internal,redis,api,sandbox-worker,clash
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ${QGENTS_DATA_ROOT:-/srv/qgents}/git-store:/var/lib/qgents/git-store
@@ -90,8 +71,9 @@ services:
       interval: 10s
       timeout: 5s
       retries: 20
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
-      mysql: {condition: service_healthy}
       sandbox-dev-tools: {condition: service_started}
 
   api:
@@ -100,7 +82,7 @@ services:
       dockerfile: Dockerfile.production
     restart: unless-stopped
     environment:
-      DB_URL: jdbc:mysql://mysql:3306/qgents?useUnicode=true&characterEncoding=utf8&serverTimezone=UTC
+      DB_URL: jdbc:mysql://${DB_HOST:-host.docker.internal}:${DB_PORT:-3306}/qgents?useUnicode=true&characterEncoding=utf8&serverTimezone=UTC
       DB_USERNAME: qgents
       DB_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD}
       REDIS_HOST: redis
@@ -123,7 +105,7 @@ services:
       GITHUB_PROXY_PORT: "7890"
       HTTP_PROXY: http://clash:7890
       HTTPS_PROXY: http://clash:7890
-      NO_PROXY: localhost,127.0.0.1,mysql,redis,api,sandbox-worker,clash
+      NO_PROXY: localhost,127.0.0.1,host.docker.internal,redis,api,sandbox-worker,clash
       MANAGEMENT_SERVER_ADDRESS: 0.0.0.0
       MANAGEMENT_SERVER_PORT: "8081"
     volumes:
@@ -131,6 +113,8 @@ services:
       - api_data:/app/data
       - api_logs:/app/logs
     expose: ["8080", "8081"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     networks: [backend]
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8081/actuator/health | grep -q UP"]
@@ -138,7 +122,6 @@ services:
       timeout: 5s
       retries: 20
     depends_on:
-      mysql: {condition: service_healthy}
       redis: {condition: service_healthy}
       clash: {condition: service_healthy}
       sandbox-worker: {condition: service_healthy}
@@ -162,7 +145,6 @@ services:
     networks: [backend]
 
 volumes:
-  mysql_data:
   redis_data:
   api_data:
   api_logs:
