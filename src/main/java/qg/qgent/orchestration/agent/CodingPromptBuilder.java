@@ -21,6 +21,18 @@ public class CodingPromptBuilder {
     static final int MAX_FILE_TREE_CHARS = 20_000;
 
     /**
+     * 绿地任务硬性要求：工作区为空时注入用户消息，阻止模型用设计散文/文字方案代替实际建文件。
+     * 与 {@link #correctiveGiveUpInstruction()} 配合，前者预防、后者兜底纠正。
+     */
+    static final String GREENFIELD_INSTRUCTION = """
+            \n
+            \n【绿地任务：工作区为空】当前工作区未检测到任何代码文件，本次任务是从零搭建项目。
+            - 必须先通过工具真实创建文件：用 create_directory 建立目录结构，用 write_file 写入项目构建文件（pom.xml / build.gradle / package.json 等）与核心源码，再逐步补齐测试与配置。
+            - 禁止用设计文档、架构说明、文字方案或纯描述代替实际文件；即使一次只能写一个文件，也要把成果落成可审查的代码文件。
+            - 只有 write_file 返回 ok=true、changed=true 或 create_directory 返回 created=true 才算真实进展；只输出方案而不建任何文件属于失败。
+            """;
+
+    /**
      * 默认使用原生协议的系统提示（无叠加，供内置兜底调用）。
      */
     public String buildSystem() {
@@ -75,7 +87,7 @@ public class CodingPromptBuilder {
                 - 需要调用工具时只使用原生函数调用，每次调用只能使用 schema 中的工具名和完整参数；不要把工具调用 JSON 写进普通文本。
                 - 工具返回 ok=false 时先读取 errorCode、retryable、nextAction，再修正参数；禁止原样重复失败调用。路径越界、权限拒绝或未知工具不可通过重试绕过。
                 - 工具返回基础设施错误时不得伪造成功；停止并在 finalResult.errors 说明。工具返回成功但 changed=false 时也不能声称产生了文件变更。
-                - 只能修改当前步骤允许路径；若工具返回 outside the current TaskStep allowed paths，说明该文件属于其他步骤，不能修改。
+                - 可写范围为当前任务全部实现步骤声明文件的并集：允许补充或修正其他步骤声明但漏写的文件；若工具返回 outside the current TaskStep allowed paths，说明目标不在 Planner 声明文件集内，不能修改，也不要通过重试绕过。
                 - 多仓库 Workspace 下，所有工具 path 都必须以当前仓库 workspacePath 开头（例如 repo-2/src/App.vue）；新建目录和新建文件也必须带此前缀，禁止使用无法确定仓库的裸路径（例如 src/App.vue、vue3/）。
                 - 只有至少一次 write_file/apply_patch 实际改变文件，或 create_directory 实际创建目录后才能 success=true；修改完成并确认无误后输出 JSON（不要输出代码围栏）：{"finalResult": {"success": true, "summary": "变更摘要", "modifiedFiles": ["相对路径"], "modifiedDirectories": ["相对目录"], "changes": ["变更说明"], "deviations": ["可选的偏差声明"]}}
                 - 收到前一轮反馈或重试上下文（打回重做）时，只有真实产生 changed=true 的文件写入后才能 success=true；只读复核、重复已存在内容、确认现状或空操作不构成完成，应输出 success=false 并在 errors 中说明原因。
@@ -168,8 +180,26 @@ public class CodingPromptBuilder {
         }
         appendTestResult(sb, input.getTestResult(), hasFeedback(input));
         sb.append("\n\n工作区文件树：\n").append(renderTree(files));
+        if (files.isEmpty()) {
+            sb.append(GREENFIELD_INSTRUCTION);
+        }
         sb.append(ContextPromptRenderer.render(input));
         return sb.toString();
+    }
+
+    /**
+     * "未尝试即放弃"纠正指令：Coding 首次运行自报 success=false 但未调用任何工具且未产生
+     * 写入时，作为第二次执行的附加用户消息，要求模型立即改用工具真正建/改文件。
+     * 与 {@link #GREENFIELD_INSTRUCTION} 配合使用；纯文本、无状态、不含 Secret。
+     */
+    public static String correctiveGiveUpInstruction() {
+        return """
+                \n
+                \n【纠正指令】你上一轮声明 success=false，但服务端未观测到任何工具调用与文件写入，工作区仍未产生代码。这属于"未动手就放弃"，不是完成。请立即改用工具真正执行：
+                - 若工作区为空，按上方绿地任务要求，用 create_directory + write_file 从零搭建项目骨架并逐文件实现。
+                - 若已有文件，先 read_file 理解现状，再用 apply_patch / replace_file / write_file 落实修改。
+                - 只有产生真实写入（工具返回 ok=true、changed=true / created=true）后才能 success=true；再次只输出说明或失败声明仍会被判为失败。
+                """;
     }
 
     /**

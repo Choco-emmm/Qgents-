@@ -125,9 +125,22 @@ public class CodingAgent implements Agent {
                 input.getRetryContext() == null ? null : input.getRetryContext().getPatchFailureCounts());
         try {
             CodingResult coding = protocol.isNative()
-                    ? executeCodingNative(input, observations, observedWrites)
+                    ? executeCodingNative(input, observations, observedWrites, null)
                     : executeCodingLegacy(input, observedWrites);
             validateAndCompleteChanges(coding, observedWrites, input);
+            // "未尝试即放弃"有界纠正重试：模型自报失败但未调用任何工具、未产生任何写入时，
+            // 以强化指令重跑一次（上限 1 次）。仍在同一 TaskRun 内完成，重试仍失败则保持
+            // 原有 FAILED 终态语义，不改变状态机路由。
+            boolean correctiveRetried = false;
+            if (protocol.isNative() && shouldRetryGaveUp(coding, observations, observedWrites, input)) {
+                log.info("CODING_GAVE_UP_RETRY phase={} workspaceId={} taskRunId={} "
+                                + "首次运行未调用任何工具且未产生写入，执行一次纠正性重试",
+                        input.getPhase(), input.getWorkspaceId(), input.getTaskRunId());
+                correctiveRetried = true;
+                coding = executeCodingNative(input, observations, observedWrites,
+                        CodingPromptBuilder.correctiveGiveUpInstruction());
+                validateAndCompleteChanges(coding, observedWrites, input);
+            }
             AgentRunOutcome outcome = new AgentRunOutcome();
             outcome.setPhase(input.getPhase());
             boolean patchUnrecoverable = !coding.isSuccess() && hasPatchRepairRequired(observedWrites);
@@ -142,7 +155,8 @@ public class CodingAgent implements Agent {
             }
             outcome.setCodingResult(coding);
             outcome.setMessage((coding.isSuccess() ? coding.getSummary() : firstError(coding))
-                    + (patchUnrecoverable ? "；补丁连续失败且 replace_file 未完成，无法继续自动修复" : ""));
+                    + (patchUnrecoverable ? "；补丁连续失败且 replace_file 未完成，无法继续自动修复" : "")
+                    + (correctiveRetried && !coding.isSuccess() ? "；已执行 1 次纠正性重试，模型仍未实际调用工具写入文件" : ""));
             outcome.setObservations(observations);
             outcome.setPatchFailureCounts(observedWrites.patchFailureCounts());
             log.info("coding agent done phase={} workspaceId={} outcome={} observations={}",
@@ -198,12 +212,36 @@ public class CodingAgent implements Agent {
     }
 
     /**
+     * "未尝试即放弃"判定：模型自报 success=false、本次 run 没有任何 changed=true 写入，
+     * 且没有任何一轮观测到工具调用（含只读工具）。只有这类"完全没动手"才触发单次纠正重试；
+     * 已调用过工具（哪怕失败）、已处于重试/质量回修链路、或模型直接声明成功（success=true，
+     * 现一律放行）均不在此列，避免 no-op 重试回环。
+     * <p>
+     * 工具调用证据来自每轮 {@link LlmObservation#toolName()}：只有工具轮非空，
+     * finalAnswer / repair / finalization 轮均为 null；本 run 无任何工具观测即"未动手"。
+     */
+    private boolean shouldRetryGaveUp(CodingResult coding, List<LlmObservation> observations,
+                                      ChangedWriteFactLedger observedWrites, AgentInput input) {
+        if (coding == null || coding.isSuccess()) {
+            return false;
+        }
+        if (observedWrites.hasChangedWrite()) {
+            return false;
+        }
+        if (input.getRetryContext() != null) {
+            return false;
+        }
+        return observations.stream()
+                .noneMatch(obs -> obs.toolName() != null && !obs.toolName().isBlank());
+    }
+
+    /**
      * 原生 Tool Calling 循环：每轮把历史（含 tool responses）回传给模型，直到输出 finalResult。
      * 每轮写入一条脱敏观测；工具执行遇到基础设施失败（Workspace 不可用）抛
      * {@link IllegalStateException}，由 run() 统一转为 FAILED_INFRASTRUCTURE。
      */
     private CodingResult executeCodingNative(AgentInput input, List<LlmObservation> observations,
-                                             ChangedWriteFactLedger observedWrites) {
+                                             ChangedWriteFactLedger observedWrites, String correctiveInstruction) {
         List<String> files = codeAccess.listFiles(input.getWorkspaceId());
         log.info("coding agent workspace files phase={} workspaceId={} files={}",
                 input.getPhase(), input.getWorkspaceId(), files.size());
@@ -217,7 +255,7 @@ public class CodingAgent implements Agent {
         String qualityRepairSkills = QualityRepairSkillContext.preloadAndRender(activateSkillTool,
                 input.getRetryContext());
         List<Message> history = new ArrayList<>();
-        history.add(buildUserMessage(input, files, qualityRepairSkills));
+        history.add(buildUserMessage(input, files, qualityRepairSkills, correctiveInstruction));
         String system = promptBuilder.buildSystem(true, input.getAgentPrompt());
         ChatHistorySearchTool chatHistorySearchTool = new ChatHistorySearchTool(contextService, input.getActorId(),
                 input.getProjectId(), input.getRequirementGroupId(), contextSearchProperties.getMaxPerRun());
@@ -278,13 +316,17 @@ public class CodingAgent implements Agent {
      * 读取失败、越权、越预算或类型不支持的附件降级为文本引用（ContextPromptRenderer 已渲染
      * [图片附件]/[文件附件]），不影响编码主流程与成功收敛。
      */
-    private UserMessage buildUserMessage(AgentInput input, List<String> files, String qualityRepairSkills) {
+    private UserMessage buildUserMessage(AgentInput input, List<String> files, String qualityRepairSkills,
+                                         String correctiveInstruction) {
         String text = promptBuilder.buildUser(input, files);
         AttachmentMediaLoader.Result attachments =
                 attachmentMediaLoader.load(input.getActorId(), input.getProjectId(), input.getConversation());
         String finalText = attachments.extraText().isEmpty() ? text : text + attachments.extraText();
         if (qualityRepairSkills != null && !qualityRepairSkills.isBlank()) {
             finalText += qualityRepairSkills;
+        }
+        if (correctiveInstruction != null && !correctiveInstruction.isBlank()) {
+            finalText += correctiveInstruction;
         }
         UserMessage.Builder builder = UserMessage.builder().text(finalText);
         if (!attachments.media().isEmpty()) {
@@ -392,43 +434,29 @@ public class CodingAgent implements Agent {
     }
 
     /**
-     * Coding 的 success 不能只由模型自报决定：必须至少有一个成功且实际改变内容的写操作，
-     * 实际写入路径会补入结果，避免模型遗漏 modifiedFiles/modifiedDirectories；没有任何证据时把结果降为协议失败，防止
-     * JSON repair 把“未执行任何文件修改”包装成 Developer 成功。
+     * Coding 的 success 以模型声明的 success 为准；本方法只负责把结果范围修正为服务端观察到的
+     * 真实 changed=true 写入事实，避免模型遗漏或编造 modifiedFiles/modifiedDirectories。
      * <p>
-     * 「目标已满足」零写入收敛仅限质量修复步骤：上一轮 Test/Review 以 FAILED_QUALITY 打回后，
-     * 若本步骤声明的目标文件已存在于 Workspace（前序步骤越界完成或历史提交已覆盖），零写入是
-     * 职责已被满足的幂等结果，按 SUCCEEDED 收敛；普通 MUTATE 步骤仍要求真实变更，避免内容错误
-     * 被文件存在性掩盖而误判成功。
+     * 当前为临时放宽（全部放行）：模型声明 success 但本次零写入时不再判
+     * CODING_NO_ACTUAL_CHANGE，而是按 SUCCEEDED 收敛，并把本步 modifiedFiles/modifiedDirectories
+     * 置空——最终 Diff 仍由工作区真实 git diff 生成，不虚报本次写入路径。原因：绿地/重试任务频繁
+     * 因"工作已在工作区、本轮无新增写入"被误判失败而整条任务跑不通；放宽后模型编造的路径不会进入
+     * 下游，但"虚报成功（成功却零产出）"不再被硬检查拦截。如需恢复严格语义，改回此方法抛出
+     * {@link ProtocolFailureCode#CODING_NO_ACTUAL_CHANGE} 即可。
      */
     private void validateAndCompleteChanges(CodingResult coding, ChangedWriteFactLedger observedWrites,
                                             AgentInput input) {
         if (coding == null || !coding.isSuccess()) {
             return;
         }
-        boolean qualityRepair = input.getRetryContext() != null && input.getRetryContext().isQualityRepair();
         if (!observedWrites.hasChangedWrite()) {
-            if (qualityRepair && TargetSatisfaction.isSatisfied(codeAccess, input.getWorkspaceId(),
-                    input.getTargetFiles())) {
-                log.info("CODING_ALREADY_SATISFIED phase={} workspaceId={} targets={}",
-                        input.getPhase(), input.getWorkspaceId(), input.getTargetFiles());
-                // 结果范围只使用服务端观察到的真实变更事实；本步无真实变更，modifiedFiles/Directories 置空，
-                // 最终 Diff 仍由工作区真实 git diff 生成，不虚报本次写入路径。
-                coding.setModifiedFiles(List.of());
-                coding.setModifiedDirectories(List.of());
-                return;
-            }
-            StringBuilder detail = new StringBuilder();
-            String summary = observedWrites.toolOutcomeSummary();
-            if (!summary.isEmpty()) {
-                detail.append("；").append(summary);
-            }
-            String cause = observedWrites.lastToolError();
-            if (cause != null) {
-                detail.append("；上一次工具失败：").append(cause).append(observedWrites.recoveryHint());
-            }
-            throw new CodingParseException(ProtocolFailureCode.CODING_NO_ACTUAL_CHANGE,
-                    "coding success requires at least one actual file or directory modification" + detail);
+            log.warn("CODING_SUCCESS_WITHOUT_WRITES phase={} workspaceId={} targets={} attempts={}",
+                    input.getPhase(), input.getWorkspaceId(), input.getTargetFiles(),
+                    observedWrites.toolOutcomeSummary());
+            // 本步无真实变更：modifiedFiles/Directories 置空，避免模型编造路径污染 Review/Test 上下文。
+            coding.setModifiedFiles(List.of());
+            coding.setModifiedDirectories(List.of());
+            return;
         }
         // 结果范围只使用服务端观察到的真实 changed=true 事实，避免模型伪造路径污染 Review/Test 上下文。
         coding.setModifiedFiles(new ArrayList<>(observedWrites.changedPaths()));

@@ -233,7 +233,7 @@ public class CodingTools {
      * 执行由 Worker 固定模板定义的测试或构建命令。该工具不接收原始命令、参数、环境变量或工作目录，
      * 也不向模型回传 stdout/stderr；详细脱敏日志仅保留在 Worker 的受控运维通道。
      */
-    @Tool(name = "run_development_command", description = "执行固定的离线测试或构建命令。"
+    @Tool(name = "run_development_command", description = "执行固定的测试或构建命令。"
             + "commandId 只能是 MAVEN_TEST、MAVEN_PACKAGE、MAVEN_WRAPPER_TEST、GRADLE_TEST、"
             + "GRADLE_WRAPPER_TEST、NPM_TEST；不可传递命令、argv、环境变量或 cwd。"
             + "可选 repositoryPath 必须是当前工作区已绑定仓库的一级相对路径，多仓库时必填。")
@@ -473,10 +473,10 @@ public class CodingTools {
         return error(result.getFailureCode(), message);
     }
 
-    @Tool(name = "ensure_trailing_newline", description = "确保已有文本文件以换行结尾：文件当前不以换行结尾时，按 read_file 返回的 expectedHash 校验后追加一个换行（保持原换行风格）；已在文件末尾时幂等返回 changed=false")
+    @Tool(name = "ensure_trailing_newline", description = "确保已有文本文件以换行结尾：文件当前不以换行结尾时，按 read_file 返回的 expectedHash 校验后追加一个换行（保持原换行风格）；已在文件末尾时幂等返回 changed=false；expectedHash 可省略——省略时使用本会话已确认的最新哈希，否则先 read_file 获取")
     public Map<String, Object> ensureTrailingNewline(
             @ToolParam(description = "工作区内的相对路径") String path,
-            @ToolParam(description = "read_file 返回的 64 位十六进制 sha256") String expectedHash) {
+            @ToolParam(description = "可选：期望的当前文件 64 位十六进制 sha256，省略则用已确认的最新哈希") String expectedHash) {
         if (path == null || path.isBlank()) {
             return error("ensure_trailing_newline requires non-empty 'path'");
         }
@@ -484,7 +484,14 @@ public class CodingTools {
         if (denied != null) {
             return error(denied);
         }
-        if (expectedHash == null || !expectedHash.matches("[0-9a-fA-F]{64}")) {
+        if (expectedHash == null || expectedHash.isBlank()) {
+            expectedHash = latestSha256.get(path);
+            if (expectedHash == null) {
+                return error("ensure_trailing_newline: no known hash for '" + path
+                        + "'; read_file first to obtain current sha256");
+            }
+        }
+        if (!expectedHash.matches("[0-9a-fA-F]{64}")) {
             return error("ensure_trailing_newline requires 64-char hex 'expectedHash' from read_file");
         }
         WorkspaceWriteResult result = writer.ensureTrailingNewline(workspaceId, path, expectedHash);
