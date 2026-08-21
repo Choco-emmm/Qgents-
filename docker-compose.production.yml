@@ -18,6 +18,8 @@ services:
   clash:
     image: docker.io/metacubex/mihomo:latest
     restart: unless-stopped
+    ports:
+      - "127.0.0.1:7890:7890"
     volumes:
       - ./deploy/mihomo:/root/.config/mihomo
     expose: ["7890"]
@@ -111,6 +113,7 @@ services:
       MANAGEMENT_SERVER_ADDRESS: 0.0.0.0
       MANAGEMENT_SERVER_PORT: "8081"
     volumes:
+      - ./src/main/resources/rsa/private_key.pem:/app/src/main/resources/rsa/private_key.pem:ro
       - ./github_app.pem:/run/secrets/github_app.pem:ro
       - api_data:/app/data
       - api_logs:/app/logs
