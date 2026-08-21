@@ -38,7 +38,8 @@ services:
     image: ghcr.io/metacubex/mihomo:latest
     restart: unless-stopped
     volumes:
-      - ./deploy/mihomo:/root/.config/mihomo:ro
+      # 配置中的 rule-providers 会把缓存写入 ruleset/，因此目录需要可写。
+      - ./deploy/mihomo:/root/.config/mihomo
     expose: ["7890"]
     networks: [backend]
     healthcheck:
