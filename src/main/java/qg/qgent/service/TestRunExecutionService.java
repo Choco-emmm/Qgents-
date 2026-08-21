@@ -1,0 +1,411 @@
+package qg.qgent.service;
+
+import org.springframework.stereotype.Service;
+import org.springframework.context.ApplicationEventPublisher;
+import qg.qgent.entity.DryRunEntity;
+import qg.qgent.entity.ProjectRepositoryEntity;
+import qg.qgent.entity.TaskEntity;
+import qg.qgent.entity.TestRunEntity;
+import qg.qgent.mapper.DryRunMapper;
+import qg.qgent.mapper.ProjectRepositoryMapper;
+import qg.qgent.mapper.TaskMapper;
+import qg.qgent.mapper.TestRunMapper;
+import qg.qgent.orchestration.worker.*;
+import qg.qgent.orchestration.ExecutionContentSanitizer;
+import qg.qgent.service.event.DryRunConflictCandidateDomainEvent;
+
+import java.time.Duration;
+import java.time.Instant;
+import java.time.LocalDateTime;
+import java.time.ZoneOffset;
+import java.util.*;
+
+/**
+ * 通过数据库租约领取 TestRun/DryRun，支持多实例并发与进程重启恢复。
+ */
+@Service
+public class TestRunExecutionService {
+    private static final Duration LEASE_MARGIN = Duration.ofMinutes(10);
+    private final TestRunMapper testRuns;
+    private final DryRunMapper dryRuns;
+    private final SandboxWorkerClient worker;
+    private final EventService events;
+    private final TaskMapper tasks;
+    private final ProjectRepositoryMapper projectRepositories;
+    private final GitStoreSyncService gitStores;
+    /** Dry Run 失败后的冲突续跑触发，不再通过 SSE eventType 反向派生。 */
+    private final ApplicationEventPublisher domainEvents;
+
+    public TestRunExecutionService(TestRunMapper testRuns, DryRunMapper dryRuns,
+                                   SandboxWorkerClient worker, EventService events, TaskMapper tasks,
+                                   ProjectRepositoryMapper projectRepositories, GitStoreSyncService gitStores,
+                                   ApplicationEventPublisher domainEvents) {
+        this.testRuns = testRuns;
+        this.dryRuns = dryRuns;
+        this.worker = worker;
+        this.events = events;
+        this.tasks = tasks;
+        this.projectRepositories = projectRepositories;
+        this.gitStores = gitStores;
+        this.domainEvents = domainEvents;
+    }
+
+    /**
+     * 创建事务提交后的快速触发；真正的互斥由数据库 claim 保证。
+     */
+    public void executeTestRun(UUID runId) {
+        TestRunEntity candidate = testRuns.selectById(runId);
+        if (candidate == null) return;
+        String token = claimTestRun(candidate);
+        if (token == null) return;
+        TestRunEntity run = testRuns.selectById(runId);
+        publishTest(run);
+        String failureStage = "PREPARE_SNAPSHOT";
+        try {
+            prepareSnapshot(run);
+            failureStage = "RESOLVE_EXECUTION_REF";
+            String expectedHeadCommit = resolveExecutionRef(run);
+            failureStage = "EXECUTE_TESTS";
+            WorkerTestExecutionResponse response = worker.executeTests(testRequest(run, expectedHeadCommit));
+            failureStage = "VALIDATE_TEST_CONTEXT";
+            requirePassedTestContext(expectedHeadCommit, response);
+            Map<String, Object> summary = testSummary(response);
+            String status = response != null && "PASSED".equals(response.getStatus()) ? "PASSED" : "FAILED";
+            if (completeTest(run, token, status, summary)) cleanupSnapshot(run);
+        } catch (RuntimeException failure) {
+            Map<String, Object> summary = failureSummary(failure);
+            summary.put("failureStage", failureStage);
+            if ("SANDBOX_WORKER_UNAVAILABLE".equals(failureCode(failure))) {
+                // 保留稳定客户端错误码，同时输出不含端点、凭据或原始异常的可操作诊断。
+                summary.put("message", workerUnavailableMessage(failure));
+            }
+            if (completeTest(run, token, "FAILED", summary)) cleanupSnapshot(run);
+        }
+    }
+
+    /**
+     * Task 测试的工作树快照必须在执行器中创建：创建接口只受理任务，不能因 Worker 瞬时不可用
+     * 同步返回 FAILED。失败由本次已领取运行持久化真实稳定错误码，恢复调度器可按租约重试。
+     */
+    private void prepareSnapshot(TestRunEntity run) {
+        if (run.getExecutionWorkspaceId() == null) return;
+        if (run.getTaskId() == null) {
+            throw new qg.qgent.api.ApiException(org.springframework.http.HttpStatus.CONFLICT,
+                    "TEST_RUN_TASK_INVALID", "隔离测试快照缺少关联 Task");
+        }
+        TaskEntity task = tasks.selectById(run.getTaskId());
+        if (task == null || !run.getProjectId().equals(task.getProjectId()) || task.getWorkspaceId() == null) {
+            throw new qg.qgent.api.ApiException(org.springframework.http.HttpStatus.CONFLICT,
+                    "TEST_RUN_TASK_INVALID", "隔离测试快照关联的 Task 或 Workspace 不可用");
+        }
+        worker.createTestSnapshot(task.getWorkspaceId(), run.getProjectRepositoryId(),
+                run.getExecutionWorkspaceId(), run.getProjectId(), run.getExecutionSourceRef());
+    }
+
+    /**
+     * DryRun 先预演合并；无冲突时再在临时 checkout 的合并结果上执行目标分支门禁 Testset。
+     */
+    public void executeDryRun(UUID runId) {
+        DryRunEntity candidate = dryRuns.selectById(runId);
+        if (candidate == null) return;
+        String token = claimDryRun(candidate);
+        if (token == null) return;
+        DryRunEntity run = dryRuns.selectById(runId);
+        publishDry(run);
+        try {
+            WorkerMergePreviewRequest previewRequest = new WorkerMergePreviewRequest();
+            previewRequest.setRepositoryId(run.getProjectRepositoryId());
+            previewRequest.setSourceRef(run.getHeadCommit());
+            previewRequest.setTargetCommit(run.getResolvedTargetCommit());
+            WorkerMergePreviewResponse preview = worker.mergePreview(previewRequest);
+            requirePreviewContext(run, preview);
+            Map<String, Object> report = new LinkedHashMap<>();
+            report.put("targetCommit", preview.getResolvedTargetCommit());
+            report.put("headCommit", preview.getResolvedHeadCommit());
+            report.put("mergeable", preview.isMergeable());
+            report.put("conflicts", preview.getConflicts() == null ? List.of() : preview.getConflicts());
+            String status = "FAILED";
+            if (preview.isMergeable()) {
+                if (run.getTestsetSnapshot() == null || run.getTestsetSnapshot().isEmpty()) {
+                    report.put("tests", Map.of("status", "NOT_REQUIRED", "results", List.of()));
+                    status = "PASSED";
+                } else {
+                    WorkerTestExecutionRequest tests = new WorkerTestExecutionRequest();
+                    tests.setExecutionId(run.getId());
+                    tests.setProjectId(run.getProjectId());
+                    tests.setRepositoryId(run.getProjectRepositoryId());
+                    tests.setRef(preview.getResolvedTargetCommit());
+                    tests.setMergeSourceRef(preview.getResolvedHeadCommit());
+                    tests.setTestsets(items(run.getTestsetSnapshot()));
+                    WorkerTestExecutionResponse testResponse = worker.executeTests(tests);
+                    requirePassedTestContext(run, testResponse);
+                    Map<String, Object> summary = testSummary(testResponse);
+                    report.put("tests", summary);
+                    status = testResponse != null && "PASSED".equals(testResponse.getStatus()) ? "PASSED" : "FAILED";
+                }
+            } else {
+                report.put("failureCode", "GIT_MERGE_CONFLICT");
+                report.put("message", "源提交与目标提交存在合并冲突");
+                report.put("tests", Map.of("status", "SKIPPED", "reason", "MERGE_CONFLICT", "results", List.of()));
+            }
+            if ("FAILED".equals(status) && !report.containsKey("failureCode")) {
+                String failureCode = testFailureCode(testSummaryFrom(report));
+                report.put("failureCode", failureCode);
+                report.put("message", "TESTSET_FAILED".equals(failureCode)
+                        ? "至少一个门禁 Testset 未通过" : "门禁 Testset 执行超时");
+            }
+            completeDry(run, token, status, report, run.getHeadCommit());
+        } catch (RuntimeException failure) {
+            completeDry(run, token, "FAILED", failureSummary(failure), null);
+        }
+    }
+
+    private String claimTestRun(TestRunEntity run) {
+        String token = UUID.randomUUID().toString();
+        LocalDateTime now = LocalDateTime.now(ZoneOffset.UTC);
+        return testRuns.claim(run.getId(), token, now, now.plus(totalTimeout(run.getExecutionSnapshot()))) == 1
+                ? token : null;
+    }
+
+    private String claimDryRun(DryRunEntity run) {
+        String token = UUID.randomUUID().toString();
+        LocalDateTime now = LocalDateTime.now(ZoneOffset.UTC);
+        return dryRuns.claim(run.getId(), token, now, now.plus(totalTimeout(run.getTestsetSnapshot()))) == 1
+                ? token : null;
+    }
+
+    /**
+     * Task 测试在受理时已经由稳定 Workspace 固定到 head/base commit；普通 Test Run 则在
+     * 异步执行阶段先把用户指定分支刷新到 Worker Git Store，再解析成不可变 SHA，保证
+     * Worker 不会因为本地镜像过期或缺少分支而直接返回 GIT_REF_NOT_FOUND。
+     */
+    private String resolveExecutionRef(TestRunEntity run) {
+        String ref = run.getExecutionSourceRef();
+        if (ref == null || ref.isBlank()) {
+            throw new qg.qgent.api.ApiException(org.springframework.http.HttpStatus.CONFLICT,
+                    "TEST_RUN_SOURCE_REF_MISSING", "测试运行缺少源提交或引用");
+        }
+        if (ref.matches("[0-9a-fA-F]{40,64}")) return ref.toLowerCase(java.util.Locale.ROOT);
+        ProjectRepositoryEntity repository = projectRepositories.selectById(run.getProjectRepositoryId());
+        // refreshTargetBranch 已包含 GitHub 当前 SHA、一次性 FETCH Grant、Worker sync 和二次 resolve 校验。
+        return gitStores.refreshTargetBranch(run.getProjectId(), repository, ref);
+    }
+
+    private WorkerTestExecutionRequest testRequest(TestRunEntity run, String executionRef) {
+        WorkerTestExecutionRequest request = new WorkerTestExecutionRequest();
+        request.setExecutionId(run.getId());
+        request.setProjectId(run.getProjectId());
+        request.setRepositoryId(run.getProjectRepositoryId());
+        if (run.getExecutionWorkspaceId() != null) request.setWorkspaceId(run.getExecutionWorkspaceId());
+        else request.setRef(executionRef);
+        request.setTestsets(items(run.getExecutionSnapshot()));
+        return request;
+    }
+
+    private List<WorkerTestExecutionItemRequest> items(List<Map<String, Object>> snapshot) {
+        if (snapshot == null || snapshot.isEmpty()) return List.of();
+        return snapshot.stream().map(value -> {
+            WorkerTestExecutionItemRequest item = new WorkerTestExecutionItemRequest();
+            item.setTestsetId(UUID.fromString(String.valueOf(value.get("testsetId"))));
+            item.setCommand(String.valueOf(value.get("command")));
+            item.setTimeoutSeconds(((Number) value.get("timeoutSeconds")).intValue());
+            item.setPassRuleType(String.valueOf(value.get("passRuleType")));
+            item.setExpectedExitCode(((Number) value.get("expectedExitCode")).intValue());
+            return item;
+        }).toList();
+    }
+
+    private Map<String, Object> testSummary(WorkerTestExecutionResponse response) {
+        Map<String, Object> summary = new LinkedHashMap<>();
+        summary.put("status", response == null ? "FAILED" : response.getStatus());
+        summary.put("resolvedHeadCommit", response == null ? null : response.getResolvedHeadCommit());
+        summary.put("resolvedSourceCommit", response == null ? null : response.getResolvedSourceCommit());
+        summary.put("resolvedTargetCommit", response == null ? null : response.getResolvedTargetCommit());
+        summary.put("results", response == null || response.getResults() == null ? List.of()
+                : response.getResults().stream().map(result -> {
+            Map<String, Object> item = new LinkedHashMap<>();
+            item.put("testsetId", result.getTestsetId());
+            item.put("status", result.getStatus());
+            item.put("exitCode", result.getExitCode());
+            // Worker 正常使用单调时钟；仍对异常响应防御性钳制，避免负耗时进入用户结果。
+            item.put("durationMs", Math.max(0L, result.getDurationMs()));
+            item.put("failureCode", result.getFailureCode());
+            item.put("message", safeDiagnosticDetail(result.getMessage()));
+            return item;
+        }).toList());
+        return summary;
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> testSummaryFrom(Map<String, Object> report) {
+        Object tests = report.get("tests");
+        return tests instanceof Map<?, ?> map ? (Map<String, Object>) map : Map.of();
+    }
+
+    @SuppressWarnings("unchecked")
+    private String testFailureCode(Map<String, Object> summary) {
+        Object results = summary.get("results");
+        if (results instanceof List<?> list) {
+            for (Object value : list) {
+                if (value instanceof Map<?, ?> item && "TIMED_OUT".equals(item.get("failureCode"))) {
+                    return "DRY_RUN_TIMEOUT";
+                }
+                if (value instanceof Map<?, ?> item && "BUILD_ENVIRONMENT_UNAVAILABLE".equals(item.get("failureCode"))) {
+                    return "SANDBOX_WORKER_UNAVAILABLE";
+                }
+                if (value instanceof Map<?, ?> item && "TEST_COMMAND_NOT_ALLOWED".equals(item.get("failureCode"))) {
+                    return "TESTSET_DEFINITION_INVALID";
+                }
+            }
+        }
+        return "TESTSET_FAILED";
+    }
+
+    private boolean completeTest(TestRunEntity run, String token, String status, Map<String, Object> summary) {
+        if (testRuns.complete(run.getId(), token, status, summary) == 1) {
+            publishTest(testRuns.selectById(run.getId()));
+            return true;
+        }
+        return false;
+    }
+
+    private void cleanupSnapshot(TestRunEntity run) {
+        if (run.getExecutionWorkspaceId() == null) return;
+        try {
+            worker.deleteWorkspace(run.getExecutionWorkspaceId());
+            testRuns.clearExecutionWorkspace(run.getId(), run.getExecutionWorkspaceId());
+        } catch (RuntimeException ignored) {
+            // 保留 execution_workspace_id，由 janitor 幂等重试。
+        }
+    }
+
+    private void completeDry(DryRunEntity run, String token, String status, Map<String, Object> report, String head) {
+        if (dryRuns.complete(run.getId(), token, status, report, head) == 1)
+            publishDry(dryRuns.selectById(run.getId()));
+    }
+
+    /**
+     * Dry Run 的两个 Git SHA 是创建时冻结的预检上下文。Worker 只能在完全相同的源提交和
+     * 目标提交上执行合并预演；否则结果不能作为 MR 前门禁事实。
+     */
+    private void requirePreviewContext(DryRunEntity run, WorkerMergePreviewResponse preview) {
+        if (preview == null || !sameCommit(run.getHeadCommit(), preview.getResolvedHeadCommit())
+                || !sameCommit(run.getResolvedTargetCommit(), preview.getResolvedTargetCommit())) {
+            throw new qg.qgent.api.ApiException(org.springframework.http.HttpStatus.CONFLICT,
+                    "DRY_RUN_CONTEXT_MISMATCH", "Sandbox Worker returned a merge preview for a different Git context");
+        }
+    }
+
+    private boolean sameCommit(String expected, String actual) {
+        return expected != null && actual != null && expected.equalsIgnoreCase(actual);
+    }
+
+    /**
+     * 普通 Test Run 和 Task 隔离快照都必须在本次固定提交上执行。Worker 仅在明确返回同一
+     * resolvedHeadCommit 时，才允许将 PASSED 持久化为用户可见的测试事实。
+     */
+    private void requirePassedTestContext(String expectedHeadCommit, WorkerTestExecutionResponse response) {
+        if (response != null && "PASSED".equals(response.getStatus())
+                && !sameCommit(expectedHeadCommit, response.getResolvedHeadCommit())) {
+            throw new qg.qgent.api.ApiException(org.springframework.http.HttpStatus.CONFLICT,
+                    "TEST_RUN_CONTEXT_MISMATCH", "Sandbox Worker passed tests for a different Git commit");
+        }
+    }
+
+    /**
+     * merge --no-commit 后临时工作树的 HEAD 仍是 targetCommit；只有 Worker 明确报告这个
+     * 固定基线，PASSED Testset 才能被用作 MR 前门禁。
+     */
+    private void requirePassedTestContext(DryRunEntity run, WorkerTestExecutionResponse response) {
+        if (response != null && "PASSED".equals(response.getStatus())
+                && (!sameCommit(run.getResolvedTargetCommit(), response.getResolvedHeadCommit())
+                || !sameCommit(run.getHeadCommit(), response.getResolvedSourceCommit())
+                || !sameCommit(run.getResolvedTargetCommit(), response.getResolvedTargetCommit()))) {
+            throw new qg.qgent.api.ApiException(org.springframework.http.HttpStatus.CONFLICT,
+                    "DRY_RUN_TEST_CONTEXT_MISMATCH", "Sandbox Worker passed tests for a different merge context");
+        }
+    }
+
+    private void publishTest(TestRunEntity run) {
+        if (run == null) return;
+        Map<String, Object> payload = new HashMap<>();
+        payload.put("projectId", run.getProjectId());
+        payload.put("testRunId", run.getId());
+        payload.put("repositoryId", run.getProjectRepositoryId());
+        payload.put("status", run.getStatus());
+        if (run.getTaskId() != null) payload.put("taskId", run.getTaskId());
+        payload.put("timestamp", Instant.now().toString());
+        events.publish(run.getProjectId(), null, "test-run.updated", run.getId().toString(), payload);
+    }
+
+    private void publishDry(DryRunEntity run) {
+        if (run == null) return;
+        Map<String, Object> payload = new HashMap<>();
+        payload.put("projectId", run.getProjectId());
+        payload.put("dryRunId", run.getId());
+        payload.put("repositoryId", run.getProjectRepositoryId());
+        payload.put("status", run.getStatus());
+        if (run.getTaskId() != null) payload.put("taskId", run.getTaskId());
+        payload.put("headCommit", run.getHeadCommit());
+        payload.put("targetBranch", run.getTargetBranch());
+        payload.put("targetCommit", run.getResolvedTargetCommit());
+        payload.put("timestamp", Instant.now().toString());
+        if ("FAILED".equals(run.getStatus()) && run.getTaskId() != null) {
+            // complete() 已返回成功，监听器以 fallbackExecution 立即消费；事务调用时则 AFTER_COMMIT 消费。
+            domainEvents.publishEvent(new DryRunConflictCandidateDomainEvent(run.getProjectId(), run.getId(),
+                    run.getTaskId()));
+        }
+        events.publish(run.getProjectId(), null, "dry-run.updated", run.getId().toString(), payload);
+    }
+
+    private String failureCode(RuntimeException failure) {
+        return failure instanceof qg.qgent.api.ApiException api ? api.code() : "EXECUTION_FAILED";
+    }
+
+    /**
+     * 将执行异常转换为可持久化、可展示的脱敏摘要；不把 Worker 原始响应或堆栈写入测试结果。
+     */
+    private Map<String, Object> failureSummary(RuntimeException failure) {
+        String code = failureCode(failure);
+        Map<String, Object> summary = new LinkedHashMap<>();
+        summary.put("failureCode", code);
+        if (failure instanceof SandboxWorkerTransportException transport) {
+            summary.put("workerDiagnosticCode", transport.diagnosticCode());
+        }
+        String message = failure == null ? null : safeDiagnosticDetail(failure.getMessage());
+        if (message == null || message.isBlank()) {
+            message = ExecutionContentSanitizer.infrastructureDescription(code);
+        }
+        summary.put("message", message);
+        return summary;
+    }
+
+    private String workerUnavailableMessage(RuntimeException failure) {
+        if (failure instanceof SandboxWorkerTransportException transport) {
+            return switch (transport.diagnosticCode()) {
+                case "WORKER_CONNECTION_REFUSED" -> "Sandbox Worker 拒绝连接，请检查容器端口映射、防火墙和服务是否已启动";
+                case "WORKER_DNS_FAILED" -> "无法解析 Sandbox Worker 服务地址，请检查 Worker 服务地址配置";
+                case "WORKER_NETWORK_UNREACHABLE" -> "无法到达 Sandbox Worker 所在网络，请检查主后端到 Worker 的路由和防火墙";
+                case "WORKER_RESPONSE_TIMEOUT" -> "等待 Sandbox Worker 响应超时，请检查 Worker 负载和请求超时配置";
+                default -> "Sandbox Worker 网络通信失败，请检查服务连通性";
+            };
+        }
+        return "Sandbox Worker 服务不可用，请检查服务状态和服务间鉴权配置";
+    }
+
+    private String safeDiagnosticDetail(String value) {
+        String sanitized = ExecutionContentSanitizer.sanitizeDiagnosticDetail(value);
+        if (sanitized == null || sanitized.isBlank()) {
+            return null;
+        }
+        return sanitized.length() <= 500 ? sanitized : sanitized.substring(0, 500);
+    }
+
+    private Duration totalTimeout(List<Map<String, Object>> snapshot) {
+        long seconds = snapshot == null ? 0 : snapshot.stream()
+                .map(value -> value.get("timeoutSeconds"))
+                .filter(Number.class::isInstance).map(Number.class::cast)
+                .mapToLong(Number::longValue).sum();
+        return Duration.ofSeconds(Math.max(1, seconds)).plus(LEASE_MARGIN);
+    }
+}

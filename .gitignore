@@ -1,0 +1,60 @@
+# Target directory
+target/
+.m2/
+.m2-local/
+.m2-temp/
+/data/
+
+# Compiled class file
+*.class
+
+# Log file
+*.log
+/logs/
+
+# BlueJ files
+*.ctxt
+
+# Mobile Tools for Java (J2ME)
+.mtj.tmp/
+
+# Package Files #
+*.jar
+*.war
+*.nar
+*.ear
+*.zip
+*.tar.gz
+*.rar
+
+# virtual machine crash logs, see http://www.java.com/en/download/help/error_hotspot.xml
+hs_err_pid*
+replay_pid*
+
+# intelliJ IDEA
+.idea/
+*.iml
+
+# VsCode
+.vscode/
+
+# ai files
+.omc/
+.claude/
+
+# ai doc files
+/docs/
+
+# 环境变量文件
+.env
+# RSA 私钥（只留后端，勿提交；公钥 public_key.pem 可提交）
+src/main/resources/rsa/private_key.pem
+
+# 数据库迁移脚本仍在开发中，当前不纳入版本控制
+/src/main/resources/db/migrations/
+
+# Private keys
+*.pem
+
+# 脚本文件
+scripts/

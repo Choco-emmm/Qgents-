@@ -1,0 +1,82 @@
+spring:
+  config:
+    import: optional:file:.env[.properties]
+  application:
+    name: qgents-sandbox-worker
+  datasource:
+    url: ${SANDBOX_DB_URL:jdbc:mysql://127.0.0.1:3306/qgents_sandbox_worker?useUnicode=true&characterEncoding=utf8&serverTimezone=UTC}
+    username: ${SANDBOX_DB_USERNAME:qgents}
+    password: ${SANDBOX_DB_PASSWORD:qgents}
+    driver-class-name: com.mysql.cj.jdbc.Driver
+  sql:
+    init:
+      # Worker 库由部署管理员先创建；应用启动仅幂等创建自身的执行记录和日志表。
+      mode: always
+      schema-locations: classpath:db/sandbox_worker_schema.sql
+      encoding: UTF-8
+
+logging:
+  file:
+    name: ${SANDBOX_LOG_FILE:logs/sandbox-worker.log}
+  logback:
+    rollingpolicy:
+      max-file-size: ${SANDBOX_LOG_MAX_FILE_SIZE:50MB}
+      max-history: ${SANDBOX_LOG_MAX_HISTORY:30}
+      total-size-cap: ${SANDBOX_LOG_TOTAL_SIZE_CAP:2GB}
+  level:
+    qg.qgent.sandboxworker.service.ToolExecutionService: ${SANDBOX_TOOL_LOG_LEVEL:WARN}
+
+server:
+  port: ${SANDBOX_WORKER_PORT:8091}
+
+sandbox:
+  # 运行时环境
+  runtime: ${SANDBOX_RUNTIME:docker}
+  # 默认空闲存活时间
+  default-idle-ttl: ${SANDBOX_DEFAULT_IDLE_TTL:30m}
+  # 最大空闲存活时间
+  max-idle-ttl: ${SANDBOX_MAX_IDLE_TTL:2h}
+  # 默认最大生命周期
+  default-max-lifetime: ${SANDBOX_DEFAULT_MAX_LIFETIME:4h}
+  # 最大生命周期
+  max-lifetime: ${SANDBOX_MAX_LIFETIME:12h}
+  # 默认执行超时时间
+  default-execution-timeout: ${SANDBOX_DEFAULT_EXECUTION_TIMEOUT:15m}
+  # 最大执行超时时间
+  max-execution-timeout: ${SANDBOX_MAX_EXECUTION_TIMEOUT:1h}
+  # 清理间隔
+  cleanup-interval: ${SANDBOX_CLEANUP_INTERVAL:30s}
+  # 执行线程数
+  execution-threads: ${SANDBOX_EXECUTION_THREADS:4}
+  # 镜像配置
+  image-profiles: ${SANDBOX_IMAGE_PROFILES:dev-tools}
+  docker-host: ${SANDBOX_DOCKER_HOST:unix:///var/run/docker.sock}
+  worker-id: ${SANDBOX_WORKER_ID:local}
+  workspace-local-root: ${SANDBOX_WORKSPACE_LOCAL_ROOT:/var/lib/qgents/workspaces}
+  workspace-docker-host-root: ${SANDBOX_WORKSPACE_DOCKER_HOST_ROOT:/srv/qgents/workspaces}
+  workspace-metadata-root: ${SANDBOX_WORKSPACE_METADATA_ROOT:/var/lib/qgents/workspace-metadata}
+  git-store-root: ${SANDBOX_GIT_STORE_ROOT:/var/lib/qgents/git-store}
+  # 主后端内部地址；仅用于兑换一次性短期 Git 凭据，真实 Token 不写入配置或数据库。
+  backend-url: ${SANDBOX_BACKEND_URL:http://qgents-backend:8080}
+  backend-service-token: ${SANDBOX_BACKEND_SERVICE_TOKEN:}
+  images:
+    dev-tools: ${SANDBOX_DEV_TOOLS_IMAGE:qgents/sandbox-dev-tools:0.2.0}
+  memory-bytes: ${SANDBOX_MEMORY_BYTES:4294967296}
+  nano-cpus: ${SANDBOX_NANO_CPUS:2000000000}
+  pids-limit: ${SANDBOX_PIDS_LIMIT:256}
+  network-policy: ${SANDBOX_NETWORK_POLICY:none}
+  # stdout 和 stderr 各自允许保留的最大字节数
+  max-output-bytes: ${SANDBOX_MAX_OUTPUT_BYTES:1048576}
+  # 单个 Sandbox 的 Maven / Maven Wrapper 临时缓存容量上限（容器内可写 tmpfs，Sandbox 销毁后清理）
+  maven-cache-size: ${SANDBOX_MAVEN_CACHE_SIZE:2g}
+  # 单个 Sandbox 的 Gradle 临时缓存容量上限（容器内可写 tmpfs，Sandbox 销毁后清理）
+  gradle-cache-size: ${SANDBOX_GRADLE_CACHE_SIZE:3g}
+  # 单个 Sandbox 的 npm 临时缓存容量上限（容器内可写 tmpfs，Sandbox 销毁后清理）
+  npm-cache-size: ${SANDBOX_NPM_CACHE_SIZE:1g}
+  developer-home-size: ${SANDBOX_DEVELOPER_HOME_SIZE:8g}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info

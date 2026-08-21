@@ -1,0 +1,417 @@
+package qg.qgent.sandboxworker.workspace;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.HttpStatus;
+import org.springframework.stereotype.Service;
+import qg.qgent.sandboxworker.api.WorkerException;
+import qg.qgent.sandboxworker.config.SandboxWorkerProperties;
+import qg.qgent.sandboxworker.service.SandboxService;
+import qg.qgent.sandboxworker.runtime.WorkspacePathResolver;
+import qg.qgent.sandboxworker.api.MergePreviewResponse;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.time.Clock;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+import java.util.UUID;
+
+/**
+ * 管理 Project 内持久 Workspace、仓库 worktree 和受控 Git 操作。
+ */
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class WorkspaceManagerService {
+    private final SandboxWorkerProperties properties;
+    private final GitRepositoryManager repositories;
+    private final SandboxService sandboxes;
+    private final WorkspaceOperationLock workspaceLock;
+    private final ObjectMapper objectMapper;
+    private final Clock clock;
+
+    /**
+     * 幂等准备 Workspace；相同编号但规格不同时拒绝。
+     */
+    public WorkspaceResponse provision(UUID workspaceId, WorkspaceProvisionRequest request) {
+        log.info("workspace provision request workspaceId={} projectId={} repos={}",
+                workspaceId, request.getProjectId(), request.getRepositories().size());
+        return workspaceLock.execute(storageKey(workspaceId), () -> provisionLocked(workspaceId, request));
+    }
+
+    private WorkspaceResponse provisionLocked(UUID workspaceId, WorkspaceProvisionRequest request) {
+        validateRequest(request);
+        Path metadata = metadataPath(workspaceId);
+        if (Files.exists(metadata)) {
+            WorkspaceResponse existing = read(metadata);
+            if (sameSpec(existing, request)) {
+                ensureGitMarker(workspacePath(workspaceId));
+                log.info("workspace exists with same spec workspaceId={} storageKey={}",
+                        workspaceId, existing.getStorageKey());
+                return refresh(existing);
+            }
+            throw conflict("WORKSPACE_SPEC_CONFLICT", "Workspace 已存在但创建规格不同");
+        }
+        Path workspace = workspacePath(workspaceId);
+        if (Files.exists(workspace))
+            throw conflict("WORKSPACE_PATH_EXISTS", "Workspace 目录存在但缺少受控元数据");
+
+        List<WorkspaceRepositoryResponse> created = new ArrayList<>();
+        String now = clock.instant().toString();
+        try {
+            Files.createDirectories(workspace);
+            ensureGitMarker(workspace);
+            for (WorkspaceRepositoryRequest repository : request.getRepositories()) {
+                Path target = workspace.resolve(repository.getWorkspacePath()).normalize();
+                GitRepositoryManager.WorktreeResult result = repositories.create(repository.getRepositoryId(), target,
+                        repository.getBaseRef(), repository.getSourceBranch());
+                created.add(new WorkspaceRepositoryResponse(repository.getRepositoryId(), repository.getWorkspacePath(),
+                        repository.getSourceBranch(), repository.getBaseRef(), result.baseCommit(),
+                        result.headCommit()));
+            }
+            WorkspaceResponse response = new WorkspaceResponse(workspaceId, request.getProjectId(),
+                    storageKey(workspaceId),
+                    "READY", List.copyOf(created), now, now);
+            write(metadata, response);
+            log.info("workspace provisioned workspaceId={} storageKey={} repos={}",
+                    workspaceId, response.getStorageKey(), created.size());
+            return response;
+        } catch (RuntimeException exception) {
+            log.error("WORKSPACE_PROVISION_FAILED workspaceId={} projectId={} category={}",
+                    workspaceId, request.getProjectId(), exception.getClass().getSimpleName());
+            for (WorkspaceRepositoryResponse repository : created) {
+                repositories.remove(repository.getRepositoryId(),
+                        workspace.resolve(repository.getWorkspacePath()).normalize());
+            }
+            deleteTree(workspace);
+            throw exception;
+        } catch (Exception exception) {
+            log.error("WORKSPACE_PROVISION_FAILED workspaceId={} projectId={} category={}",
+                    workspaceId, request.getProjectId(), exception.getClass().getSimpleName());
+            deleteTree(workspace);
+            throw new WorkerException(HttpStatus.INTERNAL_SERVER_ERROR, "WORKSPACE_PROVISION_FAILED",
+                    "准备 Workspace 失败");
+        }
+    }
+
+    /**
+     * 查询 Workspace，并刷新每个仓库的真实 HEAD。
+     */
+    public WorkspaceResponse get(UUID workspaceId) {
+        Path metadata = metadataPath(workspaceId);
+        if (!Files.isRegularFile(metadata))
+            throw new WorkerException(HttpStatus.NOT_FOUND, "WORKSPACE_NOT_FOUND", "Workspace 不存在");
+        return refresh(read(metadata));
+    }
+
+    /**
+     * 注销 linked worktree 并删除 Workspace，不删除共享 bare store。
+     */
+    public void delete(UUID workspaceId) {
+        workspaceLock.execute(storageKey(workspaceId), () -> {
+            Path metadata = metadataPath(workspaceId);
+            if (!Files.exists(metadata))
+                return null;
+            WorkspaceResponse existing = read(metadata);
+            if (sandboxes.isWorkspaceInUse(existing.getStorageKey()))
+                throw conflict("WORKSPACE_IN_USE", "Workspace 仍被运行中的 Sandbox 使用");
+            Path workspace = workspacePath(workspaceId);
+            for (WorkspaceRepositoryResponse repository : existing.getRepositories()) {
+                repositories.remove(repository.getRepositoryId(),
+                        workspace.resolve(repository.getWorkspacePath()).normalize());
+                if (repository.getSourceBranch() != null
+                        && repository.getSourceBranch().matches("qgents-test-[0-9a-fA-F-]{36}")) {
+                    repositories.deleteTemporaryBranch(repository.getRepositoryId(), repository.getSourceBranch());
+                }
+            }
+            deleteTree(workspace);
+            try {
+                Files.deleteIfExists(metadata);
+            } catch (Exception exception) {
+                throw new WorkerException(HttpStatus.INTERNAL_SERVER_ERROR,
+                        "WORKSPACE_METADATA_DELETE_FAILED", "Workspace 已删除，但元数据清理失败");
+            }
+            log.info("workspace deleted workspaceId={} storageKey={}",
+                    workspaceId, existing.getStorageKey());
+            return null;
+        });
+    }
+
+    public GitStatusResponse gitStatus(UUID workspaceId, UUID repositoryId) {
+        return workspaceLock.execute(storageKey(workspaceId), () -> {
+            WorkspaceRepositoryResponse repository = requireRepository(get(workspaceId), repositoryId);
+            return repositories.locked(repositoryId, () -> repositories.status(repositoryPath(workspaceId, repository)));
+        });
+    }
+
+    public GitDiffResponse gitDiff(UUID workspaceId, UUID repositoryId) {
+        return workspaceLock.execute(storageKey(workspaceId), () -> {
+            WorkspaceRepositoryResponse repository = requireRepository(get(workspaceId), repositoryId);
+            GitDiffResponse diff = repositories.locked(repositoryId,
+                    () -> repositories.diff(repositoryPath(workspaceId, repository)));
+            diff.setBaseCommit(repository.getBaseCommit());
+            return diff;
+        });
+    }
+
+    public GitCommitResponse gitCommit(UUID workspaceId, UUID repositoryId, GitCommitRequest request) {
+        return workspaceLock.execute(storageKey(workspaceId), () -> {
+            WorkspaceResponse workspace = get(workspaceId);
+            if (sandboxes.isWorkspaceInUse(workspace.getStorageKey()))
+                throw conflict("WORKSPACE_IN_USE", "Workspace 仍被 Sandbox 使用，不能创建 Commit");
+            WorkspaceRepositoryResponse repository = requireRepository(workspace, repositoryId);
+            GitCommitResponse committed = repositories.locked(repositoryId,
+                    () -> repositories.commit(repositoryPath(workspaceId, repository), request));
+            log.info("git commit workspaceId={} repositoryId={} branch={} commitSha={}",
+                    workspaceId, repositoryId, repository.getSourceBranch(), committed.getCommitSha());
+            return committed;
+        });
+    }
+
+    public GitPushResponse gitPush(UUID workspaceId, UUID repositoryId, GitPushRequest request) {
+        return workspaceLock.execute(storageKey(workspaceId), () -> {
+            WorkspaceRepositoryResponse repository = requireRepository(get(workspaceId), repositoryId);
+            log.info("git push requested workspaceId={} repositoryId={} branch={} expectedHeadCommit={}",
+                    workspaceId, repositoryId, repository.getSourceBranch(), request.getExpectedHeadCommit());
+            GitPushResponse pushed = repositories.push(repositoryId, repositoryPath(workspaceId, repository),
+                    repository.getSourceBranch(), request);
+            log.info("git push workspaceId={} repositoryId={} branch={} head={} verified={}",
+                    workspaceId, repositoryId, pushed.getBranch(), pushed.getHeadCommit(), pushed.isVerified());
+            return pushed;
+        });
+    }
+
+    /**
+     * 对共享 Git Store 中两个受控引用执行只读合并预演。
+     */
+    public MergePreviewResponse mergePreview(UUID repositoryId, String sourceRef, String targetCommit) {
+        return repositories.mergePreview(repositoryId, sourceRef, targetCommit);
+    }
+
+    /**
+     * 将分支、标签或 SHA 解析为不可变 commit SHA。
+     */
+    public String resolveGitRef(UUID repositoryId, String reference) {
+        return repositories.resolveRef(repositoryId, reference);
+    }
+
+    /**
+     * 仅供临时测试 Workspace 使用：把源引用合并进当前 worktree。
+     */
+    public String mergeForTest(UUID workspaceId, UUID repositoryId, String sourceRef) {
+        return workspaceLock.execute(storageKey(workspaceId), () -> {
+            WorkspaceRepositoryResponse repository = requireRepository(get(workspaceId), repositoryId);
+            return repositories.mergeForTest(repositoryId, repositoryPath(workspaceId, repository), sourceRef);
+        });
+    }
+
+    /**
+     * 清理 Worker 内部临时测试分支；只接受固定前缀。
+     */
+    public void deleteTemporaryBranch(UUID repositoryId, String branch) {
+        repositories.deleteTemporaryBranch(repositoryId, branch);
+    }
+
+    /**
+     * 创建指定 HEAD 的当前未提交工作树隔离快照；相同 snapshotWorkspaceId 可安全重试。
+     */
+    public WorkspaceResponse snapshotForTest(UUID sourceWorkspaceId, UUID repositoryId,
+                                             UUID snapshotWorkspaceId, UUID projectId, String expectedHeadCommit) {
+        if (sourceWorkspaceId.equals(snapshotWorkspaceId)) {
+            throw conflict("TEST_SNAPSHOT_ID_INVALID", "测试快照不能覆盖源 Workspace");
+        }
+        return workspaceLock.execute(storageKey(sourceWorkspaceId), () -> {
+            WorkspaceResponse source = get(sourceWorkspaceId);
+            if (!projectId.equals(source.getProjectId())) {
+                throw conflict("TEST_SNAPSHOT_PROJECT_MISMATCH", "源 Workspace 不属于当前项目");
+            }
+            WorkspaceRepositoryResponse sourceRepository = requireRepository(source, repositoryId);
+            if (!expectedHeadCommit.equalsIgnoreCase(sourceRepository.getHeadCommit())) {
+                throw conflict("TEST_SNAPSHOT_HEAD_MISMATCH", "源 Workspace HEAD 已变化，请重新发起测试");
+            }
+            GitDiffResponse sourceDiff = repositories.diff(repositoryPath(sourceWorkspaceId, sourceRepository));
+            String branch = "qgents-test-" + snapshotWorkspaceId;
+            try {
+                WorkspaceResponse existing = get(snapshotWorkspaceId);
+                WorkspaceRepositoryResponse existingRepository = requireRepository(existing, repositoryId);
+                if (projectId.equals(existing.getProjectId()) && sourceDiff.getDiffHash().equals(
+                        repositories.diff(repositoryPath(snapshotWorkspaceId, existingRepository)).getDiffHash())) {
+                    return existing;
+                }
+            } catch (WorkerException exception) {
+                if (exception.getStatus() != HttpStatus.NOT_FOUND) {
+                    cleanupTemporary(snapshotWorkspaceId, repositoryId, branch);
+                }
+            }
+            cleanupTemporary(snapshotWorkspaceId, repositoryId, branch);
+            WorkspaceRepositoryRequest repository = new WorkspaceRepositoryRequest();
+            repository.setRepositoryId(repositoryId);
+            repository.setBaseRef(sourceRepository.getHeadCommit());
+            repository.setSourceBranch(branch);
+            repository.setWorkspacePath("repository");
+            WorkspaceProvisionRequest request = new WorkspaceProvisionRequest();
+            request.setProjectId(projectId);
+            request.setRepositories(List.of(repository));
+            WorkspaceResponse snapshot = provision(snapshotWorkspaceId, request);
+            repositories.copyWorkingTreeSnapshot(repositoryId,
+                    repositoryPath(sourceWorkspaceId, sourceRepository),
+                    repositoryPath(snapshotWorkspaceId, requireRepository(snapshot, repositoryId)));
+            return get(snapshotWorkspaceId);
+        });
+    }
+
+    /**
+     * 幂等清理临时测试 worktree、残留元数据和内部临时分支。
+     */
+    public void cleanupTemporary(UUID workspaceId, UUID repositoryId, String branch) {
+        Path workspace = workspacePath(workspaceId);
+        Path repository = workspace.resolve("repository").normalize();
+        try {
+            repositories.remove(repositoryId, repository);
+        } catch (RuntimeException ignored) {
+        }
+        deleteTree(workspace);
+        try {
+            Files.deleteIfExists(metadataPath(workspaceId));
+        } catch (Exception ignored) {
+        }
+        repositories.deleteTemporaryBranch(repositoryId, branch);
+    }
+
+    private WorkspaceResponse refresh(WorkspaceResponse response) {
+        List<WorkspaceRepositoryResponse> refreshed = response.getRepositories().stream()
+                .map(repository -> new WorkspaceRepositoryResponse(repository.getRepositoryId(),
+                        repository.getWorkspacePath(),
+                        repository.getSourceBranch(), repository.getBaseRef(), repository.getBaseCommit(),
+                        repositories.head(repositoryPath(response.getId(), repository))))
+                .toList();
+        return new WorkspaceResponse(response.getId(), response.getProjectId(), response.getStorageKey(), "READY",
+                refreshed, response.getCreatedAt(), clock.instant().toString());
+    }
+
+    private void validateRequest(WorkspaceProvisionRequest request) {
+        Set<UUID> ids = new HashSet<>();
+        Set<String> paths = new HashSet<>();
+        for (WorkspaceRepositoryRequest repository : request.getRepositories()) {
+            if (!ids.add(repository.getRepositoryId()))
+                throw invalid("WORKSPACE_REPOSITORY_DUPLICATE", "同一 Workspace 不能重复声明仓库");
+            if (!paths.add(repository.getWorkspacePath()))
+                throw invalid("WORKSPACE_PATH_DUPLICATE", "多个仓库不能使用相同 Workspace 目录");
+        }
+    }
+
+    private boolean sameSpec(WorkspaceResponse existing, WorkspaceProvisionRequest request) {
+        if (!existing.getProjectId().equals(request.getProjectId())
+                || existing.getRepositories().size() != request.getRepositories().size())
+            return false;
+        return request.getRepositories().stream()
+                .allMatch(candidate -> existing.getRepositories().stream()
+                        .anyMatch(current -> current.getRepositoryId().equals(candidate.getRepositoryId())
+                                && current.getWorkspacePath().equals(candidate.getWorkspacePath())
+                                && current.getBaseRef().equals(candidate.getBaseRef())
+                                && current.getSourceBranch().equals(candidate.getSourceBranch())));
+    }
+
+    private WorkspaceRepositoryResponse requireRepository(WorkspaceResponse workspace, UUID repositoryId) {
+        return workspace.getRepositories().stream().filter(value -> value.getRepositoryId().equals(repositoryId))
+                .findFirst()
+                .orElseThrow(() -> new WorkerException(HttpStatus.NOT_FOUND, "WORKSPACE_REPOSITORY_NOT_FOUND",
+                        "Workspace 中不存在该仓库"));
+    }
+
+    private Path repositoryPath(UUID workspaceId, WorkspaceRepositoryResponse repository) {
+        return workspacePath(workspaceId).resolve(repository.getWorkspacePath()).normalize();
+    }
+
+    private WorkspaceResponse read(Path metadata) {
+        try {
+            return objectMapper.readValue(metadata.toFile(), WorkspaceResponse.class);
+        } catch (Exception exception) {
+            throw conflict("WORKSPACE_METADATA_INVALID", "Workspace 元数据损坏或无法读取");
+        }
+    }
+
+    /**
+     * 为升级前已存在的 Workspace 安全补建空 marker，并拒绝覆盖异常文件。
+     */
+    private void ensureGitMarker(Path workspace) {
+        Path marker = workspace.resolve(WorkspacePathResolver.GIT_MARKER).normalize();
+        if (!marker.startsWith(workspace) || marker.equals(workspace)) {
+            throw conflict("WORKSPACE_GIT_MARKER_INVALID", "Workspace Git 隔离 marker 路径越界");
+        }
+        try {
+            if (Files.exists(marker)) {
+                if (!Files.isRegularFile(marker, java.nio.file.LinkOption.NOFOLLOW_LINKS) || Files.size(marker) != 0) {
+                    throw conflict("WORKSPACE_GIT_MARKER_INVALID", "Workspace Git 隔离 marker 不是受控空文件");
+                }
+                return;
+            }
+            Files.write(marker, new byte[0], java.nio.file.StandardOpenOption.CREATE_NEW);
+        } catch (WorkerException exception) {
+            throw exception;
+        } catch (Exception exception) {
+            throw new WorkerException(HttpStatus.INTERNAL_SERVER_ERROR, "WORKSPACE_GIT_MARKER_CREATE_FAILED",
+                    "无法创建 Workspace Git 隔离 marker");
+        }
+    }
+
+    private void write(Path metadata, WorkspaceResponse response) {
+        try {
+            Files.createDirectories(metadata.getParent());
+            Path temporary = Files.createTempFile(metadata.getParent(), ".workspace-", ".tmp");
+            try {
+                objectMapper.writeValue(temporary.toFile(), response);
+                Files.move(temporary, metadata, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+            } finally {
+                Files.deleteIfExists(temporary);
+            }
+        } catch (Exception exception) {
+            throw new WorkerException(HttpStatus.INTERNAL_SERVER_ERROR,
+                    "WORKSPACE_METADATA_WRITE_FAILED", "无法保存 Workspace 元数据");
+        }
+    }
+
+    private void deleteTree(Path root) {
+        if (!Files.exists(root))
+            return;
+        Path expectedRoot = Path.of(properties.getWorkspaceLocalRoot()).toAbsolutePath().normalize();
+        Path normalized = root.toAbsolutePath().normalize();
+        if (!normalized.startsWith(expectedRoot) || normalized.equals(expectedRoot))
+            throw conflict("WORKSPACE_PATH_INVALID", "拒绝删除 Workspace 根目录之外的路径");
+        try (var paths = Files.walk(normalized)) {
+            for (Path path : paths.sorted(Comparator.reverseOrder()).toList())
+                Files.deleteIfExists(path);
+        } catch (Exception exception) {
+            throw new WorkerException(HttpStatus.INTERNAL_SERVER_ERROR, "WORKSPACE_DELETE_FAILED",
+                    "无法完整删除 Workspace 目录");
+        }
+    }
+
+    private Path workspacePath(UUID id) {
+        return Path.of(properties.getWorkspaceLocalRoot()).toAbsolutePath().normalize().resolve(id.toString())
+                .normalize();
+    }
+
+    private Path metadataPath(UUID id) {
+        return Path.of(properties.getWorkspaceMetadataRoot()).toAbsolutePath().normalize().resolve(id + ".json")
+                .normalize();
+    }
+
+    private String storageKey(UUID id) {
+        return "workspaces/" + id;
+    }
+
+    private WorkerException invalid(String code, String message) {
+        return new WorkerException(HttpStatus.UNPROCESSABLE_ENTITY, code, message);
+    }
+
+    private WorkerException conflict(String code, String message) {
+        return new WorkerException(HttpStatus.CONFLICT, code, message);
+    }
+}

@@ -1,0 +1,227 @@
+package qg.qgent.orchestration.preview;
+
+import qg.qgent.dto.WorkspaceDiffPreviewFileResponse;
+
+import java.io.ByteArrayOutputStream;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Optional;
+
+/**
+ * 把 git 统一 diff 文本解析为结构化文件列表（Preview {@code /files} 接口用，阶段 E）。
+ * <p>
+ * 支持 worker/本地聚合时插入的 {@code ===== repo =====} 分隔行（跳过并结束当前文件段），
+ * 识别 {@code new file mode} / {@code deleted file mode} / {@code rename from|to} /
+ * {@code Binary files ... differ} 标记，并统计 {@code +}/{@code -} 行数（排除
+ * {@code ---}/{@code +++} 文件头）。纯字符串解析，不执行任何命令、不访问文件系统。
+ */
+public final class DiffPatchFileParser {
+
+    private DiffPatchFileParser() {
+    }
+
+    public static List<WorkspaceDiffPreviewFileResponse> parse(String patch) {
+        List<WorkspaceDiffPreviewFileResponse> files = new ArrayList<>();
+        if (patch == null || patch.isBlank()) {
+            return files;
+        }
+        FileCursor current = null;
+        String repositoryPath = null;
+        for (String raw : patch.split("\n")) {
+            String line = raw.replace("\r", "");
+            if (line.startsWith("diff --git ")) {
+                close(current, files, repositoryPath);
+                current = new FileCursor(pathOf(line));
+            } else if (line.startsWith("=====")) {
+                close(current, files, repositoryPath);
+                current = null;
+                repositoryPath = repositoryPathOf(line);
+            } else if (current != null) {
+                if (line.startsWith("new file mode")) {
+                    current.changeType = "ADDED";
+                } else if (line.startsWith("deleted file mode")) {
+                    current.changeType = "DELETED";
+                } else if (line.startsWith("rename from ") || line.startsWith("rename to ")) {
+                    current.changeType = "RENAMED";
+                } else if (line.startsWith("Binary files ")) {
+                    current.binary = true;
+                } else if (line.startsWith("+++") || line.startsWith("---")) {
+                    // 文件头，非增删行
+                } else if (line.startsWith("+")) {
+                    current.additions++;
+                } else if (line.startsWith("-")) {
+                    current.deletions++;
+                }
+            }
+        }
+        close(current, files, repositoryPath);
+        return files;
+    }
+
+    /**
+     * 从聚合 patch 中提取指定仓库、指定路径的完整 unified diff。
+     * 聚合 patch 使用 {@code ===== workspacePath =====} 标记仓库边界；没有标记的
+     * 单仓库旧快照只允许以 {@code repositoryPath == null} 查询。
+     */
+    public static Optional<ParsedFile> find(String patch, String repositoryPath, String path) {
+        if (patch == null || patch.isBlank() || path == null || path.isBlank()) {
+            return Optional.empty();
+        }
+        String currentRepository = null;
+        StringBuilder block = new StringBuilder();
+        List<ParsedFile> candidates = new ArrayList<>();
+        for (String raw : patch.split("\\n", -1)) {
+            String line = raw.replace("\r", "");
+            if (line.startsWith("=====")) {
+                collect(block, currentRepository, candidates);
+                block.setLength(0);
+                currentRepository = repositoryPathOf(line);
+            } else if (line.startsWith("diff --git ")) {
+                collect(block, currentRepository, candidates);
+                block.setLength(0);
+                block.append(line).append('\n');
+            } else if (block.length() > 0) {
+                block.append(line).append('\n');
+            }
+        }
+        collect(block, currentRepository, candidates);
+        return candidates.stream()
+                .filter(file -> path.equals(file.file().getPath()))
+                .filter(file -> repositoryPath == null
+                        ? file.repositoryPath() == null
+                        : repositoryPath.equals(file.repositoryPath()))
+                .findFirst();
+    }
+
+    private static void collect(StringBuilder block, String repositoryPath, List<ParsedFile> candidates) {
+        if (block.length() == 0) {
+            return;
+        }
+        String text = block.toString();
+        List<WorkspaceDiffPreviewFileResponse> parsed = parse(text);
+        if (!parsed.isEmpty()) {
+            candidates.add(new ParsedFile(parsed.get(0), repositoryPath, text));
+        }
+    }
+
+    public record ParsedFile(WorkspaceDiffPreviewFileResponse file, String repositoryPath, String patch) {
+    }
+
+    /**
+     * 从 {@code ===== repositoryPath =====} 分隔行提取仓库相对目录；格式不符返回 null。
+     */
+    private static String repositoryPathOf(String line) {
+        String inner = line.trim();
+        if (inner.length() >= 10 && inner.startsWith("=====") && inner.endsWith("=====")) {
+            String value = inner.substring(5, inner.length() - 5).trim();
+            return value.isEmpty() ? null : value;
+        }
+        return null;
+    }
+
+    /**
+     * 从 {@code diff --git a/old b/new} 取 b/ 侧路径；路径含空格时 git 会用 C 引号
+     * （如 {@code diff --git "a/foo bar" "b/foo bar"}），两种形态都去掉引号解析。
+     */
+    private static String pathOf(String line) {
+        String rest = line.substring("diff --git ".length());
+        int idx = rest.lastIndexOf(" b/");
+        if (idx >= 0) {
+            return unquote(rest.substring(idx + 3));
+        }
+        int quoted = rest.lastIndexOf(" \"b/");
+        if (quoted >= 0) {
+            String path = unquote(rest.substring(quoted + 1));
+            return path.startsWith("b/") ? path.substring(2) : path;
+        }
+        return null;
+    }
+
+    private static String unquote(String path) {
+        if (path.length() >= 2 && path.startsWith("\"") && path.endsWith("\"")) {
+            path = path.substring(1, path.length() - 1);
+        }
+        return decodeGitQuotedPath(path);
+    }
+
+    /**
+     * Decode Git's C-style quoted path. With core.quotepath=true, non-ASCII UTF-8
+     * bytes are emitted as three-digit octal escapes, e.g. \344\275\240.
+     * Keep this compatibility path for snapshots created before the Worker fix.
+     */
+    private static String decodeGitQuotedPath(String path) {
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream(path.length());
+        for (int index = 0; index < path.length();) {
+            char value = path.charAt(index);
+            if (value != '\\' || index + 1 >= path.length()) {
+                int codePoint = path.codePointAt(index);
+                byte[] encoded = new String(Character.toChars(codePoint)).getBytes(StandardCharsets.UTF_8);
+                bytes.writeBytes(encoded);
+                index += Character.charCount(codePoint);
+                continue;
+            }
+
+            char escaped = path.charAt(index + 1);
+            if (escaped >= '0' && escaped <= '7') {
+                int end = index + 1;
+                int octal = 0;
+                int digits = 0;
+                while (end < path.length() && digits < 3) {
+                    char digit = path.charAt(end);
+                    if (digit < '0' || digit > '7') {
+                        break;
+                    }
+                    octal = octal * 8 + (digit - '0');
+                    end++;
+                    digits++;
+                }
+                bytes.write(octal);
+                index = end;
+                continue;
+            }
+
+            Character escapedCharacter = switch (escaped) {
+                case 'a' -> 7;
+                case 'b' -> 8;
+                case 't' -> 9;
+                case 'n' -> 10;
+                case 'v' -> 11;
+                case 'f' -> 12;
+                case 'r' -> 13;
+                case '\\' -> '\\';
+                case '"' -> '"';
+                default -> null;
+            };
+            if (escapedCharacter == null) {
+                bytes.write('\\');
+                bytes.write(escaped);
+            } else {
+                bytes.write(escapedCharacter);
+            }
+            index += 2;
+        }
+        return bytes.toString(StandardCharsets.UTF_8);
+    }
+
+    private static void close(FileCursor current, List<WorkspaceDiffPreviewFileResponse> files,
+                              String repositoryPath) {
+        if (current == null || current.path == null || current.path.isBlank()) {
+            return;
+        }
+        files.add(new WorkspaceDiffPreviewFileResponse(null, current.path, current.changeType,
+                current.additions, current.deletions, current.binary, repositoryPath));
+    }
+
+    private static final class FileCursor {
+        private final String path;
+        private String changeType = "MODIFIED";
+        private int additions;
+        private int deletions;
+        private boolean binary;
+
+        private FileCursor(String path) {
+            this.path = path;
+        }
+    }
+}

@@ -1,0 +1,405 @@
+openapi: 3.1.0
+info:
+  title: Qgents Workspace 与 Sandbox Worker 内部接口
+  version: 0.6.0
+  description: 内部控制面接口。调用方不能提交宿主机路径、Git 远端、凭证或任意 Git 参数。Controller 层非 2xx 响应统一为 {code,message} 错误体；协议层错误返回 INVALID_REQUEST_BODY / INVALID_MEDIA_TYPE / INVALID_ARGUMENT / MISSING_ARGUMENT / METHOD_NOT_ALLOWED / NOT_FOUND。仅安全过滤层在 Controller 之前产生的 401/403 可能使用非统一体。
+paths:
+  /internal/v1/git-resolutions:
+    post:
+      operationId: resolveGitRef
+      summary: Resolve a controlled Git ref to an immutable commit SHA
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [repositoryId, ref]
+              properties:
+                repositoryId: {type: string, format: uuid}
+                ref: {type: string, minLength: 1, maxLength: 512}
+      responses:
+        '200':
+          description: Resolved commit
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [commitSha]
+                properties:
+                  commitSha: {type: string}
+  /internal/v1/health:
+    get:
+      operationId: health
+      responses:
+        '200':
+          description: Worker 存活
+          content:
+            application/json:
+              schema: {type: object, properties: {status: {type: string}}}
+  /internal/v1/workspaces/{workspaceId}:
+    parameters: [{$ref: '#/components/parameters/WorkspaceId'}]
+    put:
+      operationId: provisionWorkspace
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/WorkspaceProvisionRequest'}}}}
+      responses: {'200': {description: 已幂等准备 Workspace, content: {application/json: {schema: {$ref: '#/components/schemas/Workspace'}}}}, '409': {description: 同一编号的规格冲突}}
+    get:
+      operationId: getWorkspace
+      responses: {'200': {description: Workspace 与真实 HEAD, content: {application/json: {schema: {$ref: '#/components/schemas/Workspace'}}}}}
+    delete:
+      operationId: deleteWorkspace
+      responses: {'204': {description: 已删除或原本不存在}, '409': {description: Workspace 仍被 Sandbox 使用}}
+  /internal/v1/workspaces/{workspaceId}/repositories/{repositoryId}/git/status:
+    parameters: [{$ref: '#/components/parameters/WorkspaceId'}, {$ref: '#/components/parameters/RepositoryId'}]
+    get:
+      operationId: getWorkspaceGitStatus
+      responses: {'200': {description: 结构化状态, content: {application/json: {schema: {$ref: '#/components/schemas/GitStatus'}}}}}
+  /internal/v1/workspaces/{workspaceId}/repositories/{repositoryId}/test-snapshots/{snapshotWorkspaceId}:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {$ref: '#/components/parameters/RepositoryId'}
+      - {name: snapshotWorkspaceId, in: path, required: true, schema: {type: string, format: uuid}}
+      - {name: projectId, in: query, required: true, schema: {type: string, format: uuid}}
+      - {name: expectedHeadCommit, in: query, required: true, schema: {type: string, minLength: 40, maxLength: 64, pattern: '^[0-9a-fA-F]{40,64}$'}, description: 创建 TestRun 时固定的源 Workspace HEAD；不一致时拒绝快照，避免测试结果归因到后续修改}
+    post:
+      operationId: createWorkspaceTestSnapshot
+      description: 将指定 HEAD 的当前未提交工作树以受控 patch 固化到独立临时 Workspace；相同快照编号可幂等重试。源 HEAD 已变化时拒绝，不测试后续修改。
+      responses:
+        '200': {description: 已固化且哈希校验通过的隔离 Workspace, content: {application/json: {schema: {$ref: '#/components/schemas/Workspace'}}}}
+        '409': {description: 快照编号非法、项目不匹配、HEAD 或快照哈希不一致}
+  /internal/v1/workspaces/{workspaceId}/repositories/{repositoryId}/git/diff:
+    parameters: [{$ref: '#/components/parameters/WorkspaceId'}, {$ref: '#/components/parameters/RepositoryId'}]
+    post:
+      operationId: createWorkspaceGitDiff
+      requestBody: {required: false, content: {application/json: {schema: {type: object, additionalProperties: false}}}}
+      responses: {'200': {description: 包含未跟踪文件的完整 patch, content: {application/json: {schema: {$ref: '#/components/schemas/GitDiff'}}}}, '413': {description: Diff 超过上限}}
+  /internal/v1/workspaces/{workspaceId}/repositories/{repositoryId}/git/commit:
+    parameters: [{$ref: '#/components/parameters/WorkspaceId'}, {$ref: '#/components/parameters/RepositoryId'}]
+    post:
+      operationId: commitWorkspaceGitDiff
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/GitCommitRequest'}}}}
+      responses: {'200': {description: '真实 Commit；同一 operationId 重试幂等返回原提交', content: {application/json: {schema: {$ref: '#/components/schemas/GitCommit'}}}}, '409': {description: Workspace 在用或审查快照不匹配}, '422': {description: 底层 Git 提交失败}}
+  /internal/v1/workspaces/{workspaceId}/repositories/{repositoryId}/git/push:
+    parameters: [{$ref: '#/components/parameters/WorkspaceId'}, {$ref: '#/components/parameters/RepositoryId'}]
+    post:
+      operationId: pushWorkspaceBranch
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/GitPushRequest'}}}}
+      responses: {'200': {description: 推送并核验成功, content: {application/json: {schema: {$ref: '#/components/schemas/GitPush'}}}}, '409': {description: expectedHeadCommit 与本地 HEAD 不一致}, '422': {description: origin 未配置或推送失败}, '502': {description: 推送后远端 SHA 核验不一致}, '504': {description: 推送命令超时}}
+  /internal/v1/git-stores/{repositoryId}/sync:
+    parameters: [{$ref: '#/components/parameters/RepositoryId'}]
+    post:
+      operationId: syncGitStore
+      description: 仅供主后端根据已绑定仓库元数据调用；不得由前端传入远程地址或凭据。
+      parameters:
+        - {name: Authorization, in: header, required: true, schema: {type: string}, description: 与 Worker 配置一致的内部服务 Bearer Token}
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/GitStoreSyncRequest'}}}}
+      responses:
+        '200': {description: bare Git Store 已初始化并完成指定分支同步, content: {application/json: {schema: {$ref: '#/components/schemas/GitStoreSync'}}}}
+        '401': {description: 缺少内部服务 Bearer Token}
+        '403': {description: 内部服务 Token 不匹配}
+        '409': {description: 远程 HEAD 与预期 SHA 不一致}
+        '422': {description: GitHub URL、分支或本地 Git Store 不合法}
+        '504': {description: Git 命令超时}
+  /internal/v1/sandboxes:
+    post:
+      operationId: createSandbox
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/CreateSandboxRequest'}}}}
+      responses:
+        '201': {description: Sandbox 已创建（相同 sandboxId 与相同关联/Workspace 规格的重复请求幂等返回已有 Sandbox）, content: {application/json: {schema: {$ref: '#/components/schemas/Sandbox'}}}}
+        '409': {description: 相同 sandboxId 但关联/Workspace 规格不一致（SANDBOX_ID_CONFLICT）}
+        '422': {description: 重复仓库、镜像不在白名单或 workspaceStorageKey 非法}
+  /internal/v1/sandboxes/{sandboxId}:
+    parameters: [{$ref: '#/components/parameters/SandboxId'}]
+    get: {operationId: getSandbox, responses: {'200': {description: Sandbox 状态, content: {application/json: {schema: {$ref: '#/components/schemas/Sandbox'}}}}, '404': {description: Sandbox 不存在}}}
+    delete: {operationId: destroySandbox, responses: {'204': {description: Sandbox 已销毁，Workspace 保留}}}
+  /internal/v1/sandboxes/{sandboxId}/lease/renew:
+    parameters: [{$ref: '#/components/parameters/SandboxId'}]
+    post:
+      operationId: renewSandboxLease
+      parameters:
+        - {name: ttlSeconds, in: query, required: false, schema: {type: integer, format: int64, minimum: 1}}
+      responses: {'200': {description: 租约已续期, content: {application/json: {schema: {$ref: '#/components/schemas/Sandbox'}}}}}
+  /internal/v1/sandboxes/{sandboxId}/tool-executions:
+    parameters: [{$ref: '#/components/parameters/SandboxId'}]
+    post:
+      operationId: executeTool
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/ToolExecutionRequest'}}}}
+      responses: {'202': {description: 已入队, content: {application/json: {schema: {$ref: '#/components/schemas/ToolExecution'}}}}}
+  /internal/v1/tool-executions/{executionId}:
+    parameters: [{$ref: '#/components/parameters/ExecutionId'}]
+    get: {operationId: getToolExecution, responses: {'200': {description: 执行结果, content: {application/json: {schema: {$ref: '#/components/schemas/ToolExecution'}}}}}}
+  /internal/v1/tool-executions/{executionId}/logs:
+    parameters: [{$ref: '#/components/parameters/ExecutionId'}]
+    get:
+      operationId: getToolExecutionLogs
+      parameters:
+        - {name: after, in: query, schema: {type: integer, format: int64, minimum: 0, default: 0}}
+        - {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 1000, default: 200}}
+      responses: {'200': {description: 有序增量日志, content: {application/json: {schema: {$ref: '#/components/schemas/ExecutionLogs'}}}}}
+  /internal/v1/tool-executions/{executionId}/cancel:
+    parameters: [{$ref: '#/components/parameters/ExecutionId'}]
+    post: {operationId: cancelToolExecution, responses: {'200': {description: 已取消, content: {application/json: {schema: {$ref: '#/components/schemas/ToolExecution'}}}}}}
+  /internal/v1/test-executions:
+    post:
+      operationId: executeTestsets
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/TestExecutionRequest'}}}}
+      responses: {'200': {description: Controlled test results, content: {application/json: {schema: {$ref: '#/components/schemas/TestExecutionResponse'}}}}}
+  /internal/v1/merge-previews:
+    post:
+      operationId: previewMerge
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/MergePreviewRequest'}}}}
+      responses: {'200': {description: Read-only merge preview, content: {application/json: {schema: {$ref: '#/components/schemas/MergePreviewResponse'}}}}}
+components:
+  parameters:
+    WorkspaceId: {name: workspaceId, in: path, required: true, schema: {type: string, format: uuid}}
+    RepositoryId: {name: repositoryId, in: path, required: true, schema: {type: string, format: uuid}}
+    SandboxId: {name: sandboxId, in: path, required: true, schema: {type: string, format: uuid}}
+    ExecutionId: {name: executionId, in: path, required: true, schema: {type: string, format: uuid}}
+  schemas:
+    TestExecutionItemRequest:
+      type: object
+      required: [testsetId, command, timeoutSeconds, passRuleType, expectedExitCode]
+      properties:
+        testsetId: {type: string, format: uuid}
+        command: {type: string, minLength: 1, maxLength: 4096}
+        timeoutSeconds: {type: integer, minimum: 1, maximum: 3600}
+        passRuleType: {type: string, enum: [EXIT_CODE]}
+        expectedExitCode: {type: integer}
+    TestExecutionRequest:
+      type: object
+      required: [executionId, projectId, repositoryId, testsets]
+      properties:
+        executionId: {type: string, format: uuid}
+        projectId: {type: string, format: uuid}
+        repositoryId: {type: string, format: uuid}
+        workspaceId: {type: [string, 'null'], format: uuid}
+        ref: {type: [string, 'null'], maxLength: 512}
+        mergeSourceRef: {type: [string, 'null'], maxLength: 512, description: DryRun 时在一次性 checkout 中合并的受控源引用}
+        testsets: {type: array, minItems: 1, maxItems: 32, items: {$ref: '#/components/schemas/TestExecutionItemRequest'}}
+    TestExecutionResponse:
+      type: object
+      properties:
+        executionId: {type: string, format: uuid}
+        status: {type: string, enum: [PASSED, FAILED]}
+        resolvedHeadCommit: {type: string}
+        results: {type: array, items: {type: object, properties: {testsetId: {type: string, format: uuid}, status: {type: string}, exitCode: {type: [integer, 'null']}, durationMs: {type: integer}, failureCode: {type: [string, 'null']}}}}
+    MergePreviewRequest:
+      type: object
+      required: [repositoryId, sourceRef, targetBranch]
+      properties:
+        repositoryId: {type: string, format: uuid}
+        sourceRef: {type: string, minLength: 1, maxLength: 512}
+        targetBranch: {type: string, minLength: 1, maxLength: 512}
+    MergePreviewResponse:
+      type: object
+      properties:
+        resolvedHeadCommit: {type: string}
+        resolvedTargetCommit: {type: string}
+        mergeable: {type: boolean}
+        conflicts: {type: array, items: {type: string}}
+    WorkspaceRepositoryRequest:
+      type: object
+      required: [repositoryId, baseRef, sourceBranch, workspacePath]
+      properties:
+        repositoryId: {type: string, format: uuid}
+        baseRef: {type: string, minLength: 1, maxLength: 256, pattern: '^[A-Za-z0-9][A-Za-z0-9._/-]*$'}
+        sourceBranch: {type: string, minLength: 1, maxLength: 256, pattern: '^[A-Za-z0-9][A-Za-z0-9._/-]*$'}
+        workspacePath: {type: string, minLength: 1, maxLength: 128, pattern: '^[A-Za-z0-9][A-Za-z0-9._-]*$'}
+    WorkspaceProvisionRequest:
+      type: object
+      required: [projectId, repositories]
+      properties:
+        projectId: {type: string, format: uuid}
+        repositories: {type: array, minItems: 1, maxItems: 32, items: {$ref: '#/components/schemas/WorkspaceRepositoryRequest'}}
+    WorkspaceRepository:
+      allOf:
+        - {$ref: '#/components/schemas/WorkspaceRepositoryRequest'}
+        - {type: object, properties: {baseCommit: {type: string}, headCommit: {type: string}}}
+    Workspace:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        projectId: {type: string, format: uuid}
+        storageKey: {type: string}
+        status: {type: string, enum: [READY]}
+        repositories: {type: array, items: {$ref: '#/components/schemas/WorkspaceRepository'}}
+        createdAt: {type: string, format: date-time}
+        updatedAt: {type: string, format: date-time}
+    GitChange:
+      type: object
+      properties: {indexStatus: {type: string}, worktreeStatus: {type: string}, path: {type: string}, originalPath: {type: [string, 'null']}}
+    GitStatus:
+      type: object
+      properties: {branch: {type: string}, headCommit: {type: string}, clean: {type: boolean}, changes: {type: array, items: {$ref: '#/components/schemas/GitChange'}}}
+    GitDiff:
+      type: object
+      properties:
+        baseCommit: {type: string, description: 生成 Diff 时固定的基准提交 SHA}
+        headCommit: {type: string}
+        diffHash: {type: string}
+        patch: {type: string}
+        files:
+          type: array
+          items: {$ref: '#/components/schemas/GitDiffFile'}
+    GitDiffFile:
+      type: object
+      description: 文件级摘要与逐行 hunk 结构（hunks 由 worker 解析 unified diff 生成）
+      properties:
+        path: {type: string}
+        previousPath: {type: [string, 'null']}
+        changeType: {type: string, enum: [ADDED, MODIFIED, DELETED, RENAMED, COPIED]}
+        additions: {type: integer}
+        deletions: {type: integer}
+        binary: {type: boolean}
+        hunks:
+          type: array
+          items: {$ref: '#/components/schemas/DiffHunk'}
+    DiffHunk:
+      type: object
+      description: 一个 hunk 的头部与逐行内容（行级红绿 diff 渲染用）
+      properties:
+        header:
+          type: object
+          properties:
+            oldStart: {type: integer, description: 旧文件起始行号（1 起）}
+            newStart: {type: integer, description: 新文件起始行号（1 起）}
+            oldLines: {type: integer, description: 旧文件覆盖行数}
+            newLines: {type: integer, description: 新文件覆盖行数}
+        lines:
+          type: array
+          items: {$ref: '#/components/schemas/DiffHunkLine'}
+    DiffHunkLine:
+      type: object
+      properties:
+        type: {type: string, enum: [CONTEXT, ADD, DELETE], description: 行类型：上下文/新增/删除}
+        oldLineNo: {type: [integer, 'null'], description: 旧文件行号；ADD 行为 null}
+        newLineNo: {type: [integer, 'null'], description: 新文件行号；DELETE 行为 null}
+        content: {type: string, description: 行内容（不含 +/- 前缀符号）}
+    GitCommitRequest:
+      type: object
+      required: [expectedHeadCommit, expectedDiffHash, message, operationId]
+      properties: {expectedHeadCommit: {type: string, minLength: 40, maxLength: 64, pattern: '^[0-9a-fA-F]{40,64}$'}, expectedDiffHash: {type: string, minLength: 71, maxLength: 71, pattern: '^sha256:[0-9a-f]{64}$'}, message: {type: string, minLength: 1, maxLength: 500}, operationId: {type: string, format: uuid, description: Commit 幂等操作ID}}
+    GitCommit: {type: object, properties: {commitSha: {type: string}}}
+    GitPushRequest:
+      type: object
+      required: [expectedHeadCommit, credentialGrantId]
+      properties: {expectedHeadCommit: {type: string, minLength: 40, maxLength: 64, pattern: '^[0-9a-fA-F]{40,64}$'}, credentialGrantId: {type: string, minLength: 1, maxLength: 128}}
+    GitPush: {type: object, properties: {branch: {type: string}, headCommit: {type: string}, verified: {type: boolean}}}
+    GitStoreSyncRequest:
+      type: object
+      required: [repositoryUrl, remoteBranch, expectedHeadCommit, credentialGrantId]
+      properties:
+        repositoryUrl: {type: string, format: uri, description: 已绑定仓库推导出的 GitHub HTTPS URL；仅允许 github.com 且无 userinfo、query、fragment 或非 443 端口}
+        remoteBranch: {type: string, minLength: 1, maxLength: 256, pattern: '^[A-Za-z0-9][A-Za-z0-9._/-]*$'}
+        expectedHeadCommit: {type: string, minLength: 40, maxLength: 64, pattern: '^[0-9a-fA-F]{40,64}$'}
+        credentialGrantId: {type: string, minLength: 1, maxLength: 128}
+    GitStoreSync:
+      type: object
+      properties:
+        repositoryId: {type: string, format: uuid}
+        remoteBranch: {type: string}
+        headCommit: {type: string}
+        created: {type: boolean}
+    ResourceLimits:
+      type: object
+      properties: {idleTtlSeconds: {type: integer, minimum: 1, maximum: 86400}, maxLifetimeSeconds: {type: integer, minimum: 1, maximum: 86400}, executionTimeoutSeconds: {type: integer, minimum: 1, maximum: 86400}}
+    CreateSandboxRequest:
+      type: object
+      required: [sandboxId, taskRunId, workspaceStorageKey, imageProfile, repositoryIds]
+      properties:
+        sandboxId: {type: string, format: uuid}
+        taskRunId: {type: string, format: uuid}
+        taskId: {type: string, format: uuid, nullable: true}
+        workspaceStorageKey: {type: string, minLength: 47, maxLength: 47, pattern: '^workspaces/[0-9a-fA-F-]{36}$'}
+        imageProfile: {type: string, minLength: 1, maxLength: 64, pattern: '^[a-z0-9][a-z0-9-]*$'}
+        repositoryIds: {type: array, maxItems: 32, uniqueItems: true, items: {type: string, format: uuid}}
+        limits: {$ref: '#/components/schemas/ResourceLimits'}
+    Sandbox:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        taskRunId: {type: string, format: uuid}
+        taskId: {type: string, format: uuid, nullable: true}
+        workspaceStorageKey: {type: string}
+        imageProfile: {type: string}
+        repositoryIds: {type: array, uniqueItems: true, items: {type: string, format: uuid}}
+        status: {type: string}
+        runtimeKind: {type: string}
+        createdAt: {type: string, format: date-time}
+        lastActiveAt: {type: string, format: date-time}
+        expiresAt: {type: string, format: date-time}
+        maxExpiresAt: {type: string, format: date-time}
+    ToolExecutionRequest:
+      type: object
+      required: [executionId, tool, arguments]
+      properties:
+        executionId: {type: string, format: uuid}
+        repositoryId: {type: string, format: uuid}
+        tool: {type: string, enum: [process.exec, file.read, file.list, file.search, file.write, file.patch, directory.create]}
+        arguments: {type: object, maxProperties: 64, description: 各工具的结构化参数（如 ProcessExecArguments、FilePatchArguments）}
+        timeoutSeconds: {type: integer, minimum: 1, maximum: 3600}
+    ProcessExecArguments:
+      type: object
+      required: [command]
+      properties:
+        command:
+          type: array
+          minItems: 1
+          maxItems: 64
+          description: 参数向量；允许常规构建工具和 sh ./gradlew 或 sh ./mvnw Wrapper，不允许 sh -c、bash -c 或任意脚本路径
+          items: {type: string, minLength: 1, maxLength: 4096}
+    # file.patch 只对已有 UTF-8 文本文件做精确局部修改，严格按声明行号应用统一 Diff，
+    # 禁止模糊匹配/自动偏移/冲突覆盖；失败保证原文件不变。参数与结果见 FilePatchArguments/FilePatchResult。
+    FilePatchArguments:
+      type: object
+      required: [path, expectedHash, patch]
+      properties:
+        path: {type: string, minLength: 1, maxLength: 1024, description: Repository 内相对路径，禁止绝对路径与 .. 越界}
+        expectedHash: {type: string, minLength: 64, maxLength: 64, pattern: '^[0-9a-fA-F]{64}$', description: 目标文件当前内容的 SHA-256，不一致时拒绝应用}
+        patch: {type: string, minLength: 1, maxLength: 1048576, description: 统一 Diff 文本，按声明行号精确应用}
+    FilePatchResult:
+      type: object
+      properties:
+        path: {type: string}
+        sha256: {type: string}
+        bytes: {type: integer}
+        changed: {type: boolean}
+    DirectoryCreateArguments:
+      type: object
+      required: [path]
+      properties:
+        path: {type: string, minLength: 1, maxLength: 1024, description: Repository 内相对目录路径，禁止绝对路径与 .. 越界}
+    DirectoryCreateResult:
+      type: object
+      required: [path, created]
+      properties:
+        path: {type: string}
+        created: {type: boolean, description: 目录是否由本次调用实际创建}
+    ToolExecution:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        ownerWorkerId: {type: string}
+        sandboxId: {type: string, format: uuid}
+        repositoryId: {type: [string, 'null'], format: uuid}
+        tool: {type: string}
+        status: {type: string, enum: [QUEUED, RUNNING, SUCCEEDED, FAILED, TIMED_OUT, CANCELLED, INTERRUPTED]}
+        exitCode: {type: [integer, 'null']}
+        result: {type: object}
+        failureCode: {type: [string, 'null'], maxLength: 64, description: 稳定失败码；正常结束为 null}
+        failureReason: {type: [string, 'null']}
+        createdAt: {type: string, format: date-time}
+        startedAt: {type: [string, 'null'], format: date-time}
+        finishedAt: {type: [string, 'null'], format: date-time}
+    ExecutionLogEntry:
+      type: object
+      properties:
+        sequence: {type: integer, format: int64}
+        stream: {type: string, enum: [SYSTEM, STDOUT, STDERR]}
+        content: {type: string}
+        timestamp: {type: string, format: date-time}
+    ExecutionLogs:
+      type: object
+      properties:
+        items: {type: array, items: {$ref: '#/components/schemas/ExecutionLogEntry'}}
+        nextCursor: {type: integer, format: int64}

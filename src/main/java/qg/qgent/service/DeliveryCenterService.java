@@ -1,0 +1,1122 @@
+package qg.qgent.service;
+
+import com.baomidou.mybatisplus.core.toolkit.Wrappers;
+import org.springframework.http.HttpStatus;
+import org.springframework.stereotype.Service;
+import qg.qgent.api.ApiException;
+import qg.qgent.api.PagedApiResponse;
+import qg.qgent.dto.*;
+import qg.qgent.entity.*;
+import qg.qgent.mapper.*;
+
+import java.nio.charset.StandardCharsets;
+import java.time.LocalDateTime;
+import java.time.ZoneOffset;
+import java.util.*;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
+
+/**
+ * 交付中心聚合服务（契约 v1.8.0 §20，成员 B B01/B02）。
+ * <p>
+ * 把 CODE（Task 级 DiffReviewBatch + Diff + MR）、MEMORY、SKILL 三类项目资源聚合为
+ * 统一的交付项列表与统计。所有派生字段（displayStatus/capabilities/openTarget）由后端
+ * 按真实资源状态与当前用户角色计算；聚合列表只返回脱敏摘要，不包含完整内容、
+ * Prompt、Token、凭据或代码 Patch。跨类型合并排序后按 updatedAt 倒序，cursor 为
+ * 偏移量的 base64 编码（实现细节，前端只需回传 nextCursor）。
+ */
+@Service
+public class DeliveryCenterService {
+
+    private static final int DEFAULT_LIMIT = 30;
+    private static final int MAX_LIMIT = 100;
+    private static final int EXCERPT_LIMIT = 200;
+    private static final long LIST_CACHE_TTL_MILLIS = 2_000L;
+    private static final int LIST_CACHE_MAX_ENTRIES = 128;
+    private static final Set<String> DELIVERY_TYPES = Set.of("CODE", "MEMORY", "SKILL", "AGENT");
+
+    private final DiffReviewBatchMapper diffBatches;
+    private final DiffMapper diffs;
+    private final MergeRequestMapper mergeRequests;
+    private final TaskMapper tasks;
+    private final RequirementGroupMapper groups;
+    private final ProjectRepositoryMapper projectRepositories;
+    private final WorkspaceRepositoryMapper worktrees;
+    private final GitHubRepositoryMapper githubRepositories;
+    private final MemoryMapper memories;
+    private final SkillMapper skills;
+    private final AgentMapper agents;
+    private final ProjectMapper projects;
+    private final TeamMapper teams;
+    private final UserMapper users;
+    private final MemoryMessageSourceMapper memorySources;
+    private final MessageMapper messages;
+    private final ProjectAccessService access;
+    /** Short-lived request coalescing for duplicate delivery-center refreshes. */
+    private final ConcurrentHashMap<String, CachedPage> listCache = new ConcurrentHashMap<>();
+
+    public DeliveryCenterService(DiffReviewBatchMapper diffBatches, DiffMapper diffs, MergeRequestMapper mergeRequests,
+                                 TaskMapper tasks, RequirementGroupMapper groups, ProjectRepositoryMapper projectRepositories,
+                                 WorkspaceRepositoryMapper worktrees, GitHubRepositoryMapper githubRepositories,
+                                 MemoryMapper memories, SkillMapper skills, AgentMapper agents, ProjectMapper projects,
+                                 TeamMapper teams, UserMapper users,
+                                 MemoryMessageSourceMapper memorySources, MessageMapper messages,
+                                 ProjectAccessService access) {
+        this.diffBatches = diffBatches;
+        this.diffs = diffs;
+        this.mergeRequests = mergeRequests;
+        this.tasks = tasks;
+        this.groups = groups;
+        this.projectRepositories = projectRepositories;
+        this.worktrees = worktrees;
+        this.githubRepositories = githubRepositories;
+        this.memories = memories;
+        this.skills = skills;
+        this.agents = agents;
+        this.projects = projects;
+        this.teams = teams;
+        this.users = users;
+        this.memorySources = memorySources;
+        this.messages = messages;
+        this.access = access;
+    }
+
+    /**
+     * 交付中心聚合列表：按筛选条件加载三类资源、合并后按更新时间倒序，游标分页。
+     *
+     * @param projectId    项目 ID
+     * @param actor        当前用户 ID
+     * @param groupId      需求群筛选（可选）
+     * @param type         资源类型筛选：CODE/MEMORY/SKILL（可选）
+     * @param displayStatus 展示状态筛选（可选）
+     * @param repositoryId 项目仓库绑定 ID 筛选（仅 CODE 匹配）
+     * @param createdBy    创建者筛选（可选）
+     * @param keyword      关键词筛选（可选，不区分大小写包含匹配）
+     * @param cursor       分页游标（上一页 nextCursor）
+     * @param limit        每页条数（默认 30，最大 100）
+     * @param requestId    请求 ID
+     * @return 统一 cursor envelope 的交付项列表
+     */
+    public PagedApiResponse<DeliveryItem> list(UUID projectId, UUID actor, String groupId, String type,
+                                               String displayStatus, String repositoryId, String createdBy,
+                                               String keyword,
+                                               String cursor, Integer limit, String requestId) {
+        access.requireProjectMember(projectId, actor);
+        UUID groupUuid = optionalUuid(groupId, "INVALID_GROUP_FILTER");
+        UUID repositoryUuid = optionalUuid(repositoryId, "INVALID_REPOSITORY_FILTER");
+        UUID creatorUuid = optionalUuid(createdBy, "INVALID_CREATEDBY_FILTER");
+        int size = clampLimit(limit);
+        int offset = decodeCursor(cursor);
+        boolean boundedCodePage = "CODE".equalsIgnoreCase(type)
+                && isBlank(groupId) && isBlank(displayStatus) && isBlank(repositoryId)
+                && isBlank(createdBy) && isBlank(keyword) && isBlank(cursor);
+        String cacheKey = listCacheKey(projectId, actor, groupId, type, displayStatus, repositoryId,
+                createdBy, keyword, cursor, size, boundedCodePage);
+        PageData pageData = loadCachedPage(cacheKey, () -> {
+            List<DeliveryItem> all = collect(projectId, actor, groupUuid, type, displayStatus, repositoryUuid,
+                    creatorUuid, keyword, boundedCodePage ? size + 1 : null);
+            boolean hasMore = offset + size < all.size();
+            List<DeliveryItem> page = all.stream().skip(offset).limit(size).toList();
+            String next = hasMore ? encodeCursor(offset + size) : null;
+            return new PageData(page, new PageInfo(next, hasMore));
+        });
+        return new PagedApiResponse<>(pageData.data(), pageData.page(), requestId);
+    }
+
+    /**
+     * 交付中心导出（契约成员 B P2）：按与 delivery-items 相同的筛选条件导出 CSV 摘要。
+     * <p>
+     * 只导出列表摘要字段（类型/标题/摘要/状态/时间/人员等），不包含完整 Memory/Skill 内容、
+     * Prompt、Token、凭据或代码 Patch。返回 UTF-8 CSV 文本（含 BOM，便于 Excel 识别中文），
+     * 空数据集同样返回表头行。CSV 生成遵循 RFC 4180 转义。
+     */
+    public String exportCsv(UUID projectId, UUID actor, String groupId, String type,
+                            String displayStatus, String repositoryId, String createdBy, String keyword) {
+        access.requireProjectMember(projectId, actor);
+        UUID groupUuid = optionalUuid(groupId, "INVALID_GROUP_FILTER");
+        UUID repositoryUuid = optionalUuid(repositoryId, "INVALID_REPOSITORY_FILTER");
+        UUID creatorUuid = optionalUuid(createdBy, "INVALID_CREATEDBY_FILTER");
+        List<DeliveryItem> items = collect(projectId, actor, groupUuid, type, displayStatus, repositoryUuid,
+                creatorUuid, keyword);
+
+        StringBuilder csv = new StringBuilder();
+        csv.append('\uFEFF'); // UTF-8 BOM：Excel 直接打开时正确识别中文
+        appendCsvRow(csv, "类型", "标题", "摘要", "展示状态", "资源状态", "需求群", "来源任务编号", "来源任务标题",
+                "创建人", "审核人", "驳回原因", "创建时间", "审核时间", "更新时间", "变更文件数", "新增行数", "删除行数", "仓库");
+        for (DeliveryItem item : items) {
+            CodeDeliveryItem code = item instanceof CodeDeliveryItem c ? c : null;
+            appendCsvRow(csv,
+                    item.getResourceType(),
+                    item.getTitle(),
+                    item.getSummary(),
+                    item.getDisplayStatus(),
+                    item.getResourceStatus(),
+                    item.getRequirementGroup() == null ? null : item.getRequirementGroup().getName(),
+                    item.getSource() == null ? null : item.getSource().getTaskDisplayCode(),
+                    item.getSource() == null ? null : item.getSource().getTaskTitle(),
+                    displayName(item.getCreator()),
+                    displayName(item.getReviewer()),
+                    item.getReviewReason(),
+                    item.getCreatedAt(),
+                    item.getReviewedAt(),
+                    item.getUpdatedAt(),
+                    code == null ? null : Integer.toString(code.getFilesChanged()),
+                    code == null ? null : Integer.toString(code.getAdditions()),
+                    code == null ? null : Integer.toString(code.getDeletions()),
+                    code == null ? null : repositoryNames(code));
+        }
+        return csv.toString();
+    }
+
+    /**
+     * 交付中心聚合统计：针对完整筛选数据集计算，不由当前分页推导。
+     * 筛选参数与 delivery-items 一致（groupId/type/status/repositoryId/createdBy/keyword），
+     * 用户切换筛选后统计同步变化。
+     */
+    public DeliverySummaryResponse summary(UUID projectId, UUID actor, String groupId, String type,
+                                           String displayStatus, String repositoryId, String createdBy,
+                                           String keyword) {
+        access.requireProjectMember(projectId, actor);
+        UUID groupUuid = optionalUuid(groupId, "INVALID_GROUP_FILTER");
+        UUID repositoryUuid = optionalUuid(repositoryId, "INVALID_REPOSITORY_FILTER");
+        UUID creatorUuid = optionalUuid(createdBy, "INVALID_CREATEDBY_FILTER");
+        List<DeliveryItem> all = collect(projectId, actor, groupUuid, type, displayStatus, repositoryUuid,
+                creatorUuid, keyword);
+
+        long code = 0, memory = 0, skill = 0, agent = 0;
+        long draft = 0, pendingReview = 0, processing = 0, accepted = 0, rejected = 0, delivered = 0,
+                failed = 0, archived = 0;
+        long pendingForCurrentUser = 0;
+        for (DeliveryItem item : all) {
+            switch (item.getResourceType()) {
+                case "CODE" -> code++;
+                case "MEMORY" -> memory++;
+                case "AGENT" -> agent++;
+                default -> skill++;
+            }
+            switch (item.getDisplayStatus()) {
+                case "DRAFT" -> draft++;
+                case "PENDING_REVIEW" -> pendingReview++;
+                case "PROCESSING" -> processing++;
+                case "ACCEPTED" -> accepted++;
+                case "REJECTED" -> rejected++;
+                case "DELIVERED" -> delivered++;
+                case "FAILED" -> failed++;
+                case "ARCHIVED" -> archived++;
+                default -> { }
+            }
+            if (isPendingForCurrentUser(item)) {
+                pendingForCurrentUser++;
+            }
+        }
+        Map<String, Long> typeCounts = new LinkedHashMap<>();
+        typeCounts.put("CODE", code);
+        typeCounts.put("MEMORY", memory);
+        typeCounts.put("SKILL", skill);
+        typeCounts.put("AGENT", agent);
+        Map<String, Long> statusCounts = new LinkedHashMap<>();
+        statusCounts.put("DRAFT", draft);
+        statusCounts.put("PENDING_REVIEW", pendingReview);
+        statusCounts.put("PROCESSING", processing);
+        statusCounts.put("ACCEPTED", accepted);
+        statusCounts.put("REJECTED", rejected);
+        statusCounts.put("DELIVERED", delivered);
+        statusCounts.put("FAILED", failed);
+        statusCounts.put("ARCHIVED", archived);
+        return new DeliverySummaryResponse(all.size(), typeCounts, statusCounts, pendingForCurrentUser,
+                repositorySummaries(all), groupSummaries(all),
+                iso(LocalDateTime.now(ZoneOffset.UTC)));
+    }
+
+    // ---------- 聚合加载 ----------
+
+    /**
+     * 加载三类资源并组装为统一交付项列表（按 updatedAt 倒序）。
+     * keyword 归一化后对完整组装结果集做不区分大小写包含匹配，分页/统计均基于该结果集。
+     */
+    private List<DeliveryItem> collect(UUID projectId, UUID actor, UUID groupUuid, String type,
+                                       String displayStatus, UUID repositoryUuid, UUID creatorUuid, String keyword,
+                                       Integer codeLimit) {
+        List<DeliveryItem> items = new ArrayList<>();
+        if (type == null || "CODE".equals(type)) {
+            items.addAll(codeItems(projectId, actor, groupUuid, displayStatus, repositoryUuid, creatorUuid, codeLimit));
+        }
+        if (type == null || "MEMORY".equals(type)) {
+            items.addAll(memoryItems(projectId, actor, groupUuid, displayStatus, creatorUuid));
+        }
+        if (type == null || "SKILL".equals(type)) {
+            items.addAll(skillItems(projectId, actor, groupUuid, displayStatus, creatorUuid));
+        }
+        if (type == null || "AGENT".equals(type)) {
+            items.addAll(agentItems(projectId, actor, groupUuid, displayStatus, creatorUuid));
+        }
+        String normalized = normalizeKeyword(keyword);
+        return items.stream()
+                .filter(item -> normalized == null || keywordMatches(item, normalized))
+                .sorted(Comparator.comparing(DeliveryItem::getUpdatedAt,
+                        Comparator.nullsLast(Comparator.naturalOrder())).reversed())
+                .toList();
+    }
+
+    private List<DeliveryItem> collect(UUID projectId, UUID actor, UUID groupUuid, String type,
+                                       String displayStatus, UUID repositoryUuid, UUID creatorUuid, String keyword) {
+        return collect(projectId, actor, groupUuid, type, displayStatus, repositoryUuid, creatorUuid, keyword, null);
+    }
+
+    private List<DeliveryItem> codeItems(UUID projectId, UUID actor, UUID groupUuid, String displayStatus,
+                                         UUID repositoryUuid, UUID creatorUuid, Integer codeLimit) {
+        var batchQuery = Wrappers.<DiffReviewBatchEntity>lambdaQuery()
+                .eq(DiffReviewBatchEntity::getProjectId, projectId)
+                .orderByDesc(DiffReviewBatchEntity::getUpdatedAt)
+                .orderByDesc(DiffReviewBatchEntity::getId);
+        if (codeLimit != null) {
+            // Only the unfiltered first CODE page uses this bound. Filtered and
+            // summary calls keep the complete aggregation semantics.
+            batchQuery.last("LIMIT " + Math.max(1, Math.min(codeLimit, MAX_LIMIT + 1)));
+        }
+        List<DiffReviewBatchEntity> batches = diffBatches.selectList(batchQuery);
+        if (batches.isEmpty()) {
+            return List.of();
+        }
+        List<UUID> batchIds = batches.stream().map(DiffReviewBatchEntity::getId).toList();
+        List<DiffEntity> allDiffs = diffs.selectList(Wrappers.<DiffEntity>lambdaQuery()
+                .in(DiffEntity::getReviewBatchId, batchIds));
+        Map<UUID, List<DiffEntity>> diffsByBatch = allDiffs.stream()
+                .collect(Collectors.groupingBy(DiffEntity::getReviewBatchId));
+        Set<UUID> taskIds = batches.stream().map(DiffReviewBatchEntity::getTaskId)
+                .filter(Objects::nonNull).collect(Collectors.toSet());
+        Map<UUID, TaskEntity> taskById = taskIds.isEmpty() ? Collections.emptyMap() : tasks
+                .selectList(Wrappers.<TaskEntity>lambdaQuery().in(TaskEntity::getId, taskIds)).stream()
+                .collect(Collectors.toMap(TaskEntity::getId, Function.identity()));
+        Set<UUID> groupIds = taskById.values().stream().map(TaskEntity::getRequirementGroupId)
+                .filter(Objects::nonNull).collect(Collectors.toSet());
+        Map<UUID, RequirementGroupEntity> groupById = groupIds.isEmpty() ? Collections.emptyMap() : groups
+                .selectList(Wrappers.<RequirementGroupEntity>lambdaQuery().in(RequirementGroupEntity::getId, groupIds))
+                .stream().collect(Collectors.toMap(RequirementGroupEntity::getId, Function.identity()));
+        Set<UUID> repoIds = allDiffs.stream().map(DiffEntity::getProjectRepositoryId)
+                .filter(Objects::nonNull).collect(Collectors.toSet());
+        Map<UUID, ProjectRepositoryEntity> bindingById = repoIds.isEmpty() ? Collections.emptyMap()
+                : projectRepositories
+                .selectList(Wrappers.<ProjectRepositoryEntity>lambdaQuery().in(ProjectRepositoryEntity::getId, repoIds))
+                .stream().collect(Collectors.toMap(ProjectRepositoryEntity::getId, Function.identity()));
+        Map<UUID, GitHubRepositoryEntity> githubById = loadGithub(bindingById.values());
+        Set<UUID> workspaceIds = batches.stream().map(DiffReviewBatchEntity::getWorkspaceId)
+                .filter(Objects::nonNull).collect(Collectors.toSet());
+        Map<UUID, WorkspaceRepositoryEntity> worktreeByRepo = workspaceIds.isEmpty() ? Collections.emptyMap()
+                : worktrees.selectByWorkspaces(new ArrayList<>(workspaceIds)).stream()
+                .collect(Collectors.toMap(WorkspaceRepositoryEntity::getProjectRepositoryId,
+                        Function.identity(), (a, b) -> a));
+        List<MergeRequestEntity> mrs = taskIds.isEmpty() ? List.of() : mergeRequests
+                .selectList(Wrappers.<MergeRequestEntity>lambdaQuery().in(MergeRequestEntity::getTaskId, taskIds));
+        Map<UUID, List<MergeRequestEntity>> mrByTask = mrs.stream()
+                .collect(Collectors.groupingBy(MergeRequestEntity::getTaskId));
+        Map<String, MergeRequestEntity> mrByRepoTask = mrs.stream()
+                .collect(Collectors.toMap(m -> m.getProjectRepositoryId() + ":" + m.getTaskId(), Function.identity(),
+                        (a, b) -> b));
+
+        List<DeliveryItem> result = new ArrayList<>();
+        for (DiffReviewBatchEntity batch : batches) {
+            TaskEntity task = taskById.get(batch.getTaskId());
+            if (task == null) {
+                continue;
+            }
+            if (groupUuid != null && !groupUuid.equals(task.getRequirementGroupId())) {
+                continue;
+            }
+            if (creatorUuid != null && !creatorUuid.equals(task.getCreatedBy())) {
+                continue;
+            }
+            List<DiffEntity> batchDiffs = diffsByBatch.getOrDefault(batch.getId(), List.of());
+            if (repositoryUuid != null && batchDiffs.stream()
+                    .noneMatch(d -> repositoryUuid.equals(d.getProjectRepositoryId()))) {
+                continue;
+            }
+            CodeDeliveryItem item = toCodeItem(batch, task, groupById.get(task.getRequirementGroupId()),
+                    batchDiffs, bindingById, githubById, worktreeByRepo, mrByTask.getOrDefault(batch.getTaskId(), List.of()),
+                    mrByRepoTask, actor);
+            if (displayStatus != null && !displayStatus.equals(item.getDisplayStatus())) {
+                continue;
+            }
+            result.add(item);
+        }
+        return result;
+    }
+
+    private List<DeliveryItem> memoryItems(UUID projectId, UUID actor, UUID groupUuid, String displayStatus,
+                                           UUID creatorUuid) {
+        List<MemoryEntity> all = memories.selectList(Wrappers.<MemoryEntity>lambdaQuery()
+                .eq(MemoryEntity::getProjectId, projectId));
+        if (all.isEmpty()) {
+            return List.of();
+        }
+        List<UUID> memoryIds = all.stream().map(MemoryEntity::getId).toList();
+        Map<UUID, List<UUID>> sourceMessageIdsByMemory = memorySources.selectByMemoryIds(memoryIds).stream()
+                .collect(Collectors.groupingBy(MemoryMessageSourceEntity::getMemoryId,
+                        Collectors.mapping(MemoryMessageSourceEntity::getMessageId, Collectors.toList())));
+        Set<UUID> messageIds = sourceMessageIdsByMemory.values().stream().flatMap(List::stream)
+                .collect(Collectors.toSet());
+        Map<UUID, MessageEntity> messageById = messageIds.isEmpty() ? Collections.emptyMap() : messages
+                .selectBatchIds(messageIds).stream().collect(Collectors.toMap(MessageEntity::getId, Function.identity()));
+        Set<UUID> groupIds = messageById.values().stream().map(MessageEntity::getRequirementGroupId)
+                .filter(Objects::nonNull).collect(Collectors.toSet());
+        Map<UUID, RequirementGroupEntity> groupById = groupIds.isEmpty() ? Collections.emptyMap() : groups
+                .selectList(Wrappers.<RequirementGroupEntity>lambdaQuery().in(RequirementGroupEntity::getId, groupIds))
+                .stream().collect(Collectors.toMap(RequirementGroupEntity::getId, Function.identity()));
+        return all.stream()
+                .filter(m -> creatorUuid == null || creatorUuid.equals(m.getCreatedBy()))
+                .map(m -> toMemoryItem(projectId, m, actor,
+                        sourceMessageIdsByMemory.getOrDefault(m.getId(), List.of()), messageById, groupById))
+                .filter(i -> groupUuid == null || (i.getRequirementGroup() != null
+                        && groupUuid.toString().equals(i.getRequirementGroup().getId())))
+                .filter(i -> displayStatus == null || displayStatus.equals(i.getDisplayStatus()))
+                .map(i -> (DeliveryItem) i)
+                .toList();
+    }
+
+    private List<DeliveryItem> skillItems(UUID projectId, UUID actor, UUID groupUuid, String displayStatus,
+                                          UUID creatorUuid) {
+        if (groupUuid != null) {
+            // Skill 无来源关系，按群筛选时不返回 SKILL 项
+            return List.of();
+        }
+        return skills.selectList(Wrappers.<SkillEntity>lambdaQuery()
+                        .eq(SkillEntity::getProjectId, projectId))
+                .stream()
+                // 交付中心只展示共享流程相关的 Skill：PRIVATE（仅创建者自己用）不进入交付中心
+                .filter(s -> !"PRIVATE".equals(s.getVisibility()))
+                .filter(s -> creatorUuid == null || creatorUuid.equals(s.getCreatedBy()))
+                .map(s -> toSkillItem(projectId, s, actor))
+                .filter(i -> displayStatus == null || displayStatus.equals(i.getDisplayStatus()))
+                .map(i -> (DeliveryItem) i)
+                .toList();
+    }
+
+    /**
+     * AGENT 交付项：团队自定义 Agent 的发布审核聚合。
+     * 只展示进入共享审核流程的 Agent：PRIVATE（未提交审核）不进入；
+     * PENDING（待审核）/TEAM（已批准共享）/ARCHIVED（已归档）进入。
+     * 系统预置 Agent（isDefault）不进入交付中心（无审核流程）。
+     */
+    private List<DeliveryItem> agentItems(UUID projectId, UUID actor, UUID groupUuid, String displayStatus,
+                                          UUID creatorUuid) {
+        if (groupUuid != null) {
+            // Agent 无需求群来源，按群筛选时不返回 AGENT 项
+            return List.of();
+        }
+        // 交付中心按项目聚合，但 Agent 属于团队：通过项目 → team 反查该团队全部自定义 Agent
+        qg.qgent.entity.ProjectEntity project = projects.selectById(projectId);
+        if (project == null || project.getTeamId() == null) {
+            return List.of();
+        }
+        return agents.selectList(Wrappers.<AgentEntity>lambdaQuery()
+                        .eq(AgentEntity::getTeamId, project.getTeamId()))
+                .stream()
+                .filter(a -> !Boolean.TRUE.equals(a.getIsDefault()))  // 系统预置不进交付中心
+                .filter(a -> !"PRIVATE".equals(a.getVisibility()))    // 未提交审核不进入
+                .filter(a -> creatorUuid == null || (a.getCreatedBy() != null && creatorUuid.equals(a.getCreatedBy())))
+                .map(a -> toAgentItem(projectId, a, actor))
+                .filter(i -> displayStatus == null || displayStatus.equals(i.getDisplayStatus()))
+                .map(i -> (DeliveryItem) i)
+                .toList();
+    }
+
+    private AgentDeliveryItem toAgentItem(UUID projectId, AgentEntity agent, UUID actor) {
+        AgentDeliveryItem item = new AgentDeliveryItem();
+        String agentId = id(agent.getId());
+        item.setId(agentId);
+        item.setProjectId(id(projectId));
+        item.setResourceType("AGENT");
+        item.setResourceId(agentId);
+        item.setTitle(agent.getName());
+        item.setSummary(excerpt(agent.getDescription()));
+        item.setVersion(null);
+        item.setResourceStatus(agent.getVisibility());  // PRIVATE/PENDING/TEAM（进入交付中心时无 PRIVATE）
+        item.setDisplayStatus(agentDisplayStatus(agent.getVisibility()));
+        item.setRequirementGroup(null);
+        item.setSource(new DeliveryItem.DeliverySource(null, null, null, null, null, null, null));
+        item.setCreator(userSummary(agent.getCreatedBy()));
+        item.setSubmitter(userSummary(agent.getCreatedBy()));  // 提交审核者即创建者
+        item.setReviewer(userSummary(agent.getReviewedBy()));
+        item.setReviewReason(agent.getReviewReason());
+        item.setCreatedAt(iso(agent.getCreatedAt()));
+        item.setSubmittedAt(iso(agent.getReviewedAt()));       // 提交审核时间以审核时间近似（无独立提交时间列）
+        item.setReviewedAt(iso(agent.getReviewedAt()));
+        item.setUpdatedAt(iso(agent.getUpdatedAt()));
+        item.setRole(agent.getRole());
+        item.setDescriptionExcerpt(excerpt(agent.getDescription()));
+        item.setIsDefault(Boolean.TRUE.equals(agent.getIsDefault()));
+        item.setCapabilities(agentCapabilities(agent, actor));
+        item.setOpenTarget(DeliveryOpenTarget.agent(agentId));
+        return item;
+    }
+
+    /**
+     * AGENT 展示状态：PENDING→PENDING_REVIEW（待审核）；TEAM→ACCEPTED（已批准共享）；ARCHIVED→ARCHIVED。
+     */
+    private String agentDisplayStatus(String visibility) {
+        return switch (visibility == null ? "" : visibility) {
+            case "PENDING" -> "PENDING_REVIEW";
+            case "TEAM" -> "ACCEPTED";
+            case "ARCHIVED" -> "ARCHIVED";
+            default -> visibility;
+        };
+    }
+
+    /**
+     * AGENT 操作能力（v2.0.6 审核化）：
+     * - submit：创建者 且 PENDING 状态下可重新提交（拒绝后修正重提）；创建者 且 PRIVATE 可提交审核（但 PRIVATE 不进交付中心，故此处不出现）
+     * - approve/reject：Team Owner 且 PENDING
+     * - archive：创建者或 Team Owner 且 TEAM（已发布）
+     * 交付中心仅展示 PENDING/TEAM/ARCHIVED，因此实际可操作项为 approve/reject（PENDING）与 archive（TEAM）。
+     */
+    private DeliveryCapabilities agentCapabilities(AgentEntity agent, UUID actor) {
+        boolean owner = agent.getCreatedBy() != null && agent.getCreatedBy().equals(actor);
+        boolean pending = "PENDING".equals(agent.getVisibility());
+        boolean team = "TEAM".equals(agent.getVisibility());
+        // Team Owner 判定：通过 agent.teamId 反查 teams.owner_user_id
+        boolean teamOwner = isTeamOwnerOf(agent, actor);
+        DeliveryCapabilities caps = new DeliveryCapabilities();
+        caps.setCanSubmitReview(false);
+        caps.setCanApprove(teamOwner && pending);
+        caps.setCanReject(teamOwner && pending);
+        caps.setCanArchive((owner || teamOwner) && team);
+        caps.setCanRetryDelivery(false);
+        caps.setCanOpenResource(true);
+        DeliveryCapabilities.DeliveryCapabilityReasons reasons = new DeliveryCapabilities.DeliveryCapabilityReasons();
+        reasons.setCanSubmitReview("AGENT_NOT_SUBMITTABLE");
+        reasons.setCanApprove(teamOwner ? (pending ? null : "AGENT_STATE_CONFLICT") : "TEAM_OWNER_REQUIRED");
+        reasons.setCanReject(teamOwner ? (pending ? null : "AGENT_STATE_CONFLICT") : "TEAM_OWNER_REQUIRED");
+        reasons.setCanArchive((owner || teamOwner) ? (team ? null : "AGENT_STATE_CONFLICT")
+                : "AGENT_ARCHIVE_FORBIDDEN");
+        reasons.setCanRetryDelivery(null);
+        reasons.setCanOpenResource(null);
+        caps.setDisabledReasons(reasons);
+        return caps;
+    }
+
+    private boolean isTeamOwnerOf(AgentEntity agent, UUID actor) {
+        if (agent.getTeamId() == null) {
+            return false;
+        }
+        qg.qgent.entity.TeamEntity team = teams.selectById(agent.getTeamId());
+        return team != null && actor.equals(team.getOwnerUserId());
+    }
+
+    // ---------- 单类组装 ----------
+
+    private CodeDeliveryItem toCodeItem(DiffReviewBatchEntity batch, TaskEntity task,
+                                        RequirementGroupEntity group, List<DiffEntity> batchDiffs,
+                                        Map<UUID, ProjectRepositoryEntity> bindingById,
+                                        Map<UUID, GitHubRepositoryEntity> githubById,
+                                        Map<UUID, WorkspaceRepositoryEntity> worktreeByRepo,
+                                        List<MergeRequestEntity> taskMrs,
+                                        Map<String, MergeRequestEntity> mrByRepoTask, UUID actor) {
+        CodeDeliveryItem item = new CodeDeliveryItem();
+        String batchId = id(batch.getId());
+        item.setId(batchId);
+        item.setProjectId(id(task.getProjectId()));
+        item.setResourceType("CODE");
+        item.setResourceId(batchId);
+        item.setTitle(task.getTitle());
+        item.setSummary(null);
+        item.setVersion(null);
+        item.setResourceStatus(batch.getReviewStatus());
+        item.setRequirementGroup(groupRef(group));
+        item.setSource(source(task, batch));
+        item.setCreator(userSummary(task.getCreatedBy()));
+        item.setSubmitter(null);
+        item.setReviewer(userSummary(batch.getReviewedBy()));
+        item.setReviewReason(batch.getReviewReason());
+        item.setCreatedAt(iso(batch.getCreatedAt()));
+        item.setSubmittedAt(null);
+        item.setReviewedAt(iso(batch.getReviewedAt()));
+        item.setUpdatedAt(iso(batch.getUpdatedAt()));
+
+        item.setDiffReviewId(batchId);
+        // 代表性 Diff：批次内 projectRepositoryId 升序第一条（与 Task 详情 diffReviewSummary 同源），
+        // 交付中心「查看 Diff」直接跳转 Diff 查看页
+        item.setDiffId(batchDiffs.stream()
+                .sorted(Comparator.comparing(DiffEntity::getProjectRepositoryId,
+                        Comparator.nullsLast(Comparator.naturalOrder())))
+                .map(diff -> id(diff.getId()))
+                .findFirst()
+                .orElse(null));
+        item.setReviewStatus(batch.getReviewStatus());
+        item.setDeliveryStatus(batch.getDeliveryStatus());
+        item.setDisplayStatus(codeDisplayStatus(batch));
+        item.setOpenTarget(DeliveryOpenTarget.taskDiffReview(id(task.getId()), batchId));
+
+        List<DiffEntity> ordered = batchDiffs.stream()
+                .sorted(Comparator.comparing(DiffEntity::getCreatedAt,
+                        Comparator.nullsLast(Comparator.naturalOrder())))
+                .toList();
+        int files = 0, additions = 0, deletions = 0;
+        for (DiffEntity diff : ordered) {
+            Map<String, Object> stats = diff.getChangeStats();
+            if (stats != null) {
+                files += intValue(stats.get("files"));
+                additions += intValue(stats.get("additions"));
+                deletions += intValue(stats.get("deletions"));
+            }
+        }
+        item.setFilesChanged(files);
+        item.setAdditions(additions);
+        item.setDeletions(deletions);
+
+        List<CodeDeliveryItem.RepositoryRef> repos = new ArrayList<>();
+        for (DiffEntity diff : ordered) {
+            ProjectRepositoryEntity binding = bindingById.get(diff.getProjectRepositoryId());
+            String name = bindingName(binding, githubById.get(binding == null ? null : binding.getRepositoryId()));
+            WorkspaceRepositoryEntity worktree = worktreeByRepo.get(diff.getProjectRepositoryId());
+            repos.add(new CodeDeliveryItem.RepositoryRef(id(diff.getProjectRepositoryId()), name,
+                    worktree == null ? null : worktree.getSourceBranch()));
+        }
+        item.setRepositories(repos);
+
+        List<RepositoryDeliverySummary> deliveries = new ArrayList<>();
+        for (DiffEntity diff : ordered) {
+            ProjectRepositoryEntity binding = bindingById.get(diff.getProjectRepositoryId());
+            MergeRequestEntity mr = mrByRepoTask.get(id(diff.getProjectRepositoryId()) + ":" + id(task.getId()));
+            deliveries.add(new RepositoryDeliverySummary(id(diff.getProjectRepositoryId()),
+                    bindingName(binding, githubById.get(binding == null ? null : binding.getRepositoryId())),
+                    diff.getDeliveryStatus(), diff.getDeliveryFailureCode(), diff.getDeliveryFailureReason(),
+                    mr == null ? null : mergeRequestSummary(mr, binding, githubById), iso(diff.getUpdatedAt())));
+        }
+        item.setRepositoryDeliveries(deliveries);
+
+        MergeRequestEntity firstMr = taskMrs.stream()
+                .sorted(Comparator.comparing(MergeRequestEntity::getCreatedAt,
+                        Comparator.nullsLast(Comparator.naturalOrder())))
+                .findFirst().orElse(null);
+        if (firstMr != null) {
+            ProjectRepositoryEntity binding = bindingById.get(firstMr.getProjectRepositoryId());
+            item.setMergeRequest(mergeRequestSummary(firstMr, binding, githubById));
+        } else {
+            item.setMergeRequest(null);
+        }
+        item.setCapabilities(codeCapabilities(batch, task, actor));
+        return item;
+    }
+
+    private MemoryDeliveryItem toMemoryItem(UUID projectId, MemoryEntity memory, UUID actor,
+                                            List<UUID> sourceMessageIds,
+                                            Map<UUID, MessageEntity> messageById,
+                                            Map<UUID, RequirementGroupEntity> groupById) {
+        MemoryDeliveryItem item = new MemoryDeliveryItem();
+        String memoryId = id(memory.getId());
+        item.setId(memoryId);
+        item.setProjectId(id(projectId));
+        item.setResourceType("MEMORY");
+        item.setResourceId(memoryId);
+        item.setTitle(memory.getTitle());
+        item.setSummary(excerpt(memory.getContent()));
+        item.setVersion(null);
+        item.setResourceStatus(memory.getStatus());
+        item.setDisplayStatus(memoryDisplayStatus(memory.getStatus()));
+        // 需求群来源：由来源消息的 requirement_group_id 派生；无来源时 null
+        MessageEntity firstSource = sourceMessageIds.stream().map(messageById::get)
+                .filter(Objects::nonNull).findFirst().orElse(null);
+        RequirementGroupEntity sourceGroup = firstSource == null ? null
+                : groupById.get(firstSource.getRequirementGroupId());
+        item.setRequirementGroup(sourceGroup == null ? null
+                : new DeliveryItem.RequirementGroupRef(id(sourceGroup.getId()), sourceGroup.getName()));
+        item.setSource(new DeliveryItem.DeliverySource(null, null, null, null, null,
+                firstSource == null ? null : id(firstSource.getId()), null));
+        item.setCreator(userSummary(memory.getCreatedBy()));
+        item.setSubmitter(userSummary(memory.getSubmittedBy()));
+        item.setReviewer(userSummary(memory.getReviewerId()));
+        item.setReviewReason(memory.getRejectionReason());
+        item.setCreatedAt(iso(memory.getCreatedAt()));
+        item.setSubmittedAt(iso(memory.getSubmittedAt()));
+        item.setReviewedAt(iso(memory.getReviewedAt()));
+        item.setUpdatedAt(iso(memory.getUpdatedAt()));
+        item.setCategory(memory.getCategory());
+        item.setTags(memory.getTags() == null ? List.of() : memory.getTags());
+        item.setVisibility("PROJECT_SHARED");
+        item.setSources(sourceMessageIds.stream().map(messageById::get).filter(Objects::nonNull)
+                .map(message -> {
+                    MemorySourceRef ref = new MemorySourceRef();
+                    ref.setGroupId(message.getRequirementGroupId());
+                    ref.setMessageId(message.getId());
+                    return ref;
+                })
+                .toList());
+        item.setContentExcerpt(excerpt(memory.getContent()));
+        item.setCapabilities(memoryCapabilities(memory, actor));
+        item.setOpenTarget(DeliveryOpenTarget.memory(memoryId));
+        return item;
+    }
+
+    private SkillDeliveryItem toSkillItem(UUID projectId, SkillEntity skill, UUID actor) {
+        SkillDeliveryItem item = new SkillDeliveryItem();
+        String skillId = id(skill.getId());
+        item.setId(skillId);
+        item.setProjectId(id(projectId));
+        item.setResourceType("SKILL");
+        item.setResourceId(skillId);
+        item.setTitle(skill.getName());
+        item.setSummary(excerpt(skill.getContent()));
+        item.setVersion(null);
+        item.setResourceStatus(skill.getStatus());
+        item.setDisplayStatus(skillDisplayStatus(skill.getStatus()));
+        item.setRequirementGroup(null);
+        item.setSource(new DeliveryItem.DeliverySource(null, null, null, null, null, null, null));
+        item.setCreator(userSummary(skill.getCreatedBy()));
+        item.setSubmitter(userSummary(skill.getSubmittedBy()));
+        item.setReviewer(userSummary(skill.getReviewerId()));
+        item.setReviewReason(skill.getRejectionReason());
+        item.setCreatedAt(iso(skill.getCreatedAt()));
+        item.setSubmittedAt(iso(skill.getSubmittedAt()));
+        item.setReviewedAt(iso(skill.getReviewedAt()));
+        item.setUpdatedAt(iso(skill.getUpdatedAt()));
+        item.setTags(skill.getTags() == null ? List.of() : skill.getTags());
+        item.setVisibility(skill.getVisibility());
+        item.setCapabilitySummary(null);
+        item.setContentExcerpt(excerpt(skill.getContent()));
+        item.setCapabilities(skillCapabilities(skill, actor));
+        item.setOpenTarget(DeliveryOpenTarget.skill(skillId));
+        return item;
+    }
+
+    // ---------- 状态 / 能力派生 ----------
+
+    /**
+     * CODE 展示状态映射：PENDING_CONFIRMATION→PROCESSING；ACCEPTED 按交付状态细分。
+     */
+    private String codeDisplayStatus(DiffReviewBatchEntity batch) {
+        return switch (batch.getReviewStatus()) {
+            case "PENDING_CONFIRMATION" -> "PROCESSING";
+            case "REJECTED" -> "REJECTED";
+            case "SUPERSEDED" -> "SUPERSEDED";
+            case "ACCEPTED" -> switch (batch.getDeliveryStatus() == null ? "" : batch.getDeliveryStatus()) {
+                case "DELIVERED" -> "DELIVERED";
+                case "PARTIALLY_DELIVERED", "FAILED" -> "FAILED";
+                default -> "PROCESSING";
+            };
+            default -> "PROCESSING";
+        };
+    }
+
+    private String memoryDisplayStatus(String status) {
+        return "APPROVED".equals(status) ? "ACCEPTED" : status;
+    }
+
+    private String skillDisplayStatus(String status) {
+        return "PUBLISHED".equals(status) ? "ACCEPTED" : status;
+    }
+
+    private DeliveryCapabilities codeCapabilities(DiffReviewBatchEntity batch, TaskEntity task, UUID actor) {
+        boolean ownerOrAdmin = access.isOwnerOrAdmin(task.getCreatedBy(), task.getProjectId(), actor);
+        boolean pendingConfirmation = "PENDING_CONFIRMATION".equals(batch.getReviewStatus());
+        boolean accepted = "ACCEPTED".equals(batch.getReviewStatus());
+        String deliveryStatus = batch.getDeliveryStatus() == null ? "" : batch.getDeliveryStatus();
+        boolean retryable = accepted && ("PARTIALLY_DELIVERED".equals(deliveryStatus) || "FAILED".equals(deliveryStatus));
+        String forbid = ownerOrAdmin ? null : "DIFF_REVIEW_FORBIDDEN";
+
+        DeliveryCapabilities caps = new DeliveryCapabilities();
+        caps.setCanSubmitReview(false);
+        caps.setCanApprove(ownerOrAdmin && pendingConfirmation);
+        caps.setCanReject(ownerOrAdmin && pendingConfirmation);
+        caps.setCanArchive(false);
+        caps.setCanRetryDelivery(ownerOrAdmin && retryable);
+        caps.setCanOpenResource(true);
+        DeliveryCapabilities.DeliveryCapabilityReasons reasons = new DeliveryCapabilities.DeliveryCapabilityReasons();
+        reasons.setCanSubmitReview("NOT_SUPPORTED");
+        String reviewDisabled = "SUPERSEDED".equals(batch.getReviewStatus())
+                ? "DIFF_REVIEW_SUPERSEDED" : "DIFF_REVIEW_NOT_DECIDABLE";
+        reasons.setCanApprove(!pendingConfirmation ? reviewDisabled : forbid);
+        reasons.setCanReject(!pendingConfirmation ? reviewDisabled : forbid);
+        reasons.setCanArchive("NOT_SUPPORTED");
+        reasons.setCanRetryDelivery(!retryable ? "DIFF_DELIVERY_NOT_RETRYABLE" : forbid);
+        reasons.setCanOpenResource(null);
+        caps.setDisabledReasons(reasons);
+        return caps;
+    }
+
+    private DeliveryCapabilities memoryCapabilities(MemoryEntity memory, UUID actor) {
+        boolean admin = access.isProjectAdmin(memory.getProjectId(), actor);
+        boolean creatorOrAdmin = admin || memory.getCreatedBy().equals(actor);
+        String status = memory.getStatus();
+        boolean submittable = creatorOrAdmin && ("DRAFT".equals(status) || "REJECTED".equals(status));
+        boolean decidable = admin && "PENDING_REVIEW".equals(status);
+        boolean archivable = admin && "APPROVED".equals(status);
+
+        DeliveryCapabilities caps = new DeliveryCapabilities();
+        caps.setCanSubmitReview(submittable);
+        caps.setCanApprove(decidable);
+        caps.setCanReject(decidable);
+        caps.setCanArchive(archivable);
+        caps.setCanRetryDelivery(false);
+        caps.setCanOpenResource(true);
+        DeliveryCapabilities.DeliveryCapabilityReasons reasons = new DeliveryCapabilities.DeliveryCapabilityReasons();
+        reasons.setCanSubmitReview(!submittable ? (!creatorOrAdmin ? "MEMORY_FORBIDDEN" : "MEMORY_STATE_CONFLICT") : null);
+        reasons.setCanApprove(!decidable ? (!admin ? "PROJECT_ADMIN_REQUIRED" : "MEMORY_STATE_CONFLICT") : null);
+        reasons.setCanReject(reasons.getCanApprove());
+        reasons.setCanArchive(!archivable ? (!admin ? "PROJECT_ADMIN_REQUIRED" : "MEMORY_STATE_CONFLICT") : null);
+        reasons.setCanRetryDelivery("NOT_SUPPORTED");
+        reasons.setCanOpenResource(null);
+        caps.setDisabledReasons(reasons);
+        return caps;
+    }
+
+    private DeliveryCapabilities skillCapabilities(SkillEntity skill, UUID actor) {
+        boolean admin = access.isProjectAdmin(skill.getProjectId(), actor);
+        boolean creatorOrAdmin = admin || skill.getCreatedBy().equals(actor);
+        String status = skill.getStatus();
+        boolean submittable = creatorOrAdmin && ("DRAFT".equals(status) || "REJECTED".equals(status));
+        boolean decidable = admin && "PENDING_REVIEW".equals(status);
+        boolean archivable = admin && "PUBLISHED".equals(status);
+
+        DeliveryCapabilities caps = new DeliveryCapabilities();
+        caps.setCanSubmitReview(submittable);
+        caps.setCanApprove(decidable);
+        caps.setCanReject(decidable);
+        caps.setCanArchive(archivable);
+        caps.setCanRetryDelivery(false);
+        caps.setCanOpenResource(true);
+        DeliveryCapabilities.DeliveryCapabilityReasons reasons = new DeliveryCapabilities.DeliveryCapabilityReasons();
+        reasons.setCanSubmitReview(!submittable ? (!creatorOrAdmin ? "SKILL_FORBIDDEN" : "SKILL_STATE_CONFLICT") : null);
+        reasons.setCanApprove(!decidable ? (!admin ? "PROJECT_ADMIN_REQUIRED" : "SKILL_STATE_CONFLICT") : null);
+        reasons.setCanReject(reasons.getCanApprove());
+        reasons.setCanArchive(!archivable ? (!admin ? "PROJECT_ADMIN_REQUIRED" : "SKILL_STATE_CONFLICT") : null);
+        reasons.setCanRetryDelivery("NOT_SUPPORTED");
+        reasons.setCanOpenResource(null);
+        caps.setDisabledReasons(reasons);
+        return caps;
+    }
+
+    private boolean isPendingForCurrentUser(DeliveryItem item) {
+        DeliveryCapabilities caps = item.getCapabilities();
+        if (caps == null) {
+            return false;
+        }
+        boolean actionable = caps.isCanSubmitReview() || caps.isCanApprove() || caps.isCanReject()
+                || caps.isCanArchive() || caps.isCanRetryDelivery();
+        if (!actionable) {
+            return false;
+        }
+        return switch (item.getDisplayStatus() == null ? "" : item.getDisplayStatus()) {
+            case "DRAFT", "PENDING_REVIEW", "PROCESSING", "FAILED" -> true;
+            default -> false;
+        };
+    }
+
+    // ---------- 统计辅助 ----------
+
+    private List<RepositorySummaryItem> repositorySummaries(List<DeliveryItem> items) {
+        Map<String, List<CodeDeliveryItem>> byRepo = items.stream()
+                .filter(i -> i instanceof CodeDeliveryItem)
+                .map(i -> (CodeDeliveryItem) i)
+                .flatMap(c -> c.getRepositories().stream()
+                        .map(r -> Map.entry(r.getRepositoryId(), c)))
+                .collect(Collectors.groupingBy(Map.Entry::getKey,
+                        Collectors.mapping(Map.Entry::getValue, Collectors.toList())));
+        List<RepositorySummaryItem> result = new ArrayList<>();
+        for (Map.Entry<String, List<CodeDeliveryItem>> entry : byRepo.entrySet()) {
+            String repositoryId = entry.getKey();
+            List<CodeDeliveryItem> related = entry.getValue();
+            long total = related.size();
+            long accepted = related.stream().filter(i -> "ACCEPTED".equals(i.getDisplayStatus())
+                    || "DELIVERED".equals(i.getDisplayStatus())).count();
+            long pending = related.stream().filter(i -> "DRAFT".equals(i.getDisplayStatus())
+                    || "PENDING_REVIEW".equals(i.getDisplayStatus())
+                    || "PROCESSING".equals(i.getDisplayStatus())).count();
+            long failed = related.stream().filter(i -> "FAILED".equals(i.getDisplayStatus())
+                    || "REJECTED".equals(i.getDisplayStatus())).count();
+            String name = related.stream().map(CodeDeliveryItem::getRepositories).flatMap(List::stream)
+                    .filter(r -> repositoryId.equals(r.getRepositoryId())).map(CodeDeliveryItem.RepositoryRef::getName)
+                    .filter(Objects::nonNull).findFirst().orElse(null);
+            MergeRequestSummary mr = related.stream().map(CodeDeliveryItem::getMergeRequest)
+                    .filter(Objects::nonNull).findFirst().orElse(null);
+            String deliveryStatus = related.stream().map(CodeDeliveryItem::getDeliveryStatus)
+                    .filter(Objects::nonNull).max(Comparator.naturalOrder()).orElse(null);
+            result.add(new RepositorySummaryItem(repositoryId, name, total, accepted, pending, failed,
+                    deliveryStatus, mr));
+        }
+        return result;
+    }
+
+    private List<RequirementGroupSummaryItem> groupSummaries(List<DeliveryItem> items) {
+        Map<String, List<DeliveryItem>> byGroup = items.stream()
+                .filter(i -> i.getRequirementGroup() != null)
+                .collect(Collectors.groupingBy(i -> i.getRequirementGroup().getId()));
+        List<RequirementGroupSummaryItem> result = new ArrayList<>();
+        for (Map.Entry<String, List<DeliveryItem>> entry : byGroup.entrySet()) {
+            List<DeliveryItem> related = entry.getValue();
+            long pending = related.stream().filter(i -> "DRAFT".equals(i.getDisplayStatus())
+                    || "PENDING_REVIEW".equals(i.getDisplayStatus())
+                    || "PROCESSING".equals(i.getDisplayStatus())
+                    || "FAILED".equals(i.getDisplayStatus())).count();
+            String name = related.stream().map(i -> i.getRequirementGroup().getName())
+                    .filter(Objects::nonNull).findFirst().orElse(null);
+            result.add(new RequirementGroupSummaryItem(entry.getKey(), name, related.size(), pending));
+        }
+        return result;
+    }
+
+    // ---------- 摘要辅助 ----------
+
+    private DeliveryItem.DeliverySource source(TaskEntity task, DiffReviewBatchEntity batch) {
+        return new DeliveryItem.DeliverySource(id(task.getId()), task.getDisplayCode(), task.getTitle(),
+                id(batch.getFinalCodingTaskRunId()), null, id(task.getTriggerMessageId()), null);
+    }
+
+    private DeliveryItem.RequirementGroupRef groupRef(RequirementGroupEntity group) {
+        return group == null ? null : new DeliveryItem.RequirementGroupRef(id(group.getId()), group.getName());
+    }
+
+    private MergeRequestSummary mergeRequestSummary(MergeRequestEntity mr,
+                                                    ProjectRepositoryEntity binding,
+                                                    Map<UUID, GitHubRepositoryEntity> githubById) {
+        GitHubRepositoryEntity repo = binding == null ? null : githubById.get(binding.getRepositoryId());
+        String webUrl = repo == null || repo.getOwnerLogin() == null || repo.getName() == null
+                ? null : "https://github.com/" + repo.getOwnerLogin() + "/" + repo.getName()
+                + "/pull/" + mr.getProviderNumber();
+        return new MergeRequestSummary(id(mr.getId()), mr.getProviderNumber(), mr.getTitle(), mr.getStatus(), webUrl);
+    }
+
+    private Map<UUID, GitHubRepositoryEntity> loadGithub(Collection<ProjectRepositoryEntity> bindings) {
+        Set<UUID> repoIds = bindings.stream().map(ProjectRepositoryEntity::getRepositoryId)
+                .filter(Objects::nonNull).collect(Collectors.toSet());
+        return repoIds.isEmpty() ? Collections.emptyMap() : githubRepositories
+                .selectList(Wrappers.<GitHubRepositoryEntity>lambdaQuery().in(GitHubRepositoryEntity::getId, repoIds))
+                .stream().collect(Collectors.toMap(GitHubRepositoryEntity::getId, Function.identity()));
+    }
+
+    private String bindingName(ProjectRepositoryEntity binding, GitHubRepositoryEntity repo) {
+        if (binding != null && binding.getDisplayName() != null && !binding.getDisplayName().isBlank()) {
+            return binding.getDisplayName();
+        }
+        return repo == null ? null : repo.getName();
+    }
+
+    private UserSummary userSummary(UUID userId) {
+        if (userId == null) {
+            return null;
+        }
+        UserEntity user = users.selectById(userId);
+        return user == null ? null
+                : new UserSummary(user.getId().toString(), user.getDisplayName(), user.getAvatarUrl());
+    }
+
+    private String displayName(UserSummary user) {
+        return user == null ? null : user.getDisplayName();
+    }
+
+    private String repositoryNames(CodeDeliveryItem code) {
+        return code.getRepositories().stream().map(CodeDeliveryItem.RepositoryRef::getName)
+                .filter(Objects::nonNull).distinct().collect(Collectors.joining("; "));
+    }
+
+    /**
+     * 按 RFC 4180 追加一行 CSV：字段含逗号/引号/换行时用双引号包裹，内部引号翻倍转义。
+     */
+    private void appendCsvRow(StringBuilder csv, String... cells) {
+        for (int i = 0; i < cells.length; i++) {
+            if (i > 0) {
+                csv.append(',');
+            }
+            csv.append(csvCell(cells[i]));
+        }
+        csv.append("\r\n");
+    }
+
+    private String csvCell(String value) {
+        if (value == null) {
+            return "";
+        }
+        if (value.indexOf(',') >= 0 || value.indexOf('"') >= 0
+                || value.indexOf('\n') >= 0 || value.indexOf('\r') >= 0) {
+            return "\"" + value.replace("\"", "\"\"") + "\"";
+        }
+        return value;
+    }
+
+    private String excerpt(String content) {
+        if (content == null) {
+            return null;
+        }
+        String trimmed = content.trim();
+        return trimmed.length() <= EXCERPT_LIMIT ? trimmed : trimmed.substring(0, EXCERPT_LIMIT);
+    }
+
+    private int intValue(Object value) {
+        if (value instanceof Number number) {
+            return number.intValue();
+        }
+        return 0;
+    }
+
+    private UUID optionalUuid(String raw, String errorCode) {
+        if (raw == null || raw.isBlank()) {
+            return null;
+        }
+        try {
+            return UUID.fromString(raw.trim());
+        } catch (IllegalArgumentException e) {
+            throw new ApiException(HttpStatus.BAD_REQUEST, errorCode, "筛选参数格式非法");
+        }
+    }
+
+    /**
+     * 规范化 keyword：去除首尾空白并小写化；空白串等同于未传；超过 100 个 Unicode 字符返回 422。
+     */
+    private String normalizeKeyword(String raw) {
+        if (raw == null) {
+            return null;
+        }
+        String trimmed = raw.strip();
+        if (trimmed.isEmpty()) {
+            return null;
+        }
+        if (trimmed.codePointCount(0, trimmed.length()) > 100) {
+            throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "INVALID_QUERY_PARAMETER",
+                    "keyword must be 100 characters or fewer");
+        }
+        return trimmed.toLowerCase(Locale.ROOT);
+    }
+
+    /**
+     * 关键词匹配范围（契约字段）：公共 title/summary/resourceId、来源任务编号与标题、
+     * 创建人/提交人展示名、CODE 仓库名、MEMORY/SKILL 摘要字段。全部字段拼接后按包含匹配。
+     */
+    private boolean keywordMatches(DeliveryItem item, String keyword) {
+        StringBuilder sb = new StringBuilder();
+        appendSearchable(sb, item.getTitle());
+        appendSearchable(sb, item.getSummary());
+        appendSearchable(sb, item.getResourceId());
+        if (item.getSource() != null) {
+            appendSearchable(sb, item.getSource().getTaskDisplayCode());
+            appendSearchable(sb, item.getSource().getTaskTitle());
+        }
+        appendSearchable(sb, displayName(item.getCreator()));
+        appendSearchable(sb, displayName(item.getSubmitter()));
+        if (item instanceof CodeDeliveryItem code) {
+            if (code.getRepositories() != null) {
+                for (CodeDeliveryItem.RepositoryRef repository : code.getRepositories()) {
+                    appendSearchable(sb, repository.getName());
+                }
+            }
+        } else if (item instanceof MemoryDeliveryItem memory) {
+            appendSearchable(sb, memory.getContentExcerpt());
+        } else if (item instanceof SkillDeliveryItem skill) {
+            appendSearchable(sb, skill.getCapabilitySummary());
+            appendSearchable(sb, skill.getContentExcerpt());
+        }
+        return sb.toString().contains(keyword);
+    }
+
+    private void appendSearchable(StringBuilder sb, String value) {
+        if (value != null && !value.isBlank()) {
+            sb.append(value.toLowerCase(Locale.ROOT)).append(' ');
+        }
+    }
+
+    private int clampLimit(Integer limit) {
+        int value = limit == null ? DEFAULT_LIMIT : limit;
+        if (value < 1) {
+            return 1;
+        }
+        return Math.min(value, MAX_LIMIT);
+    }
+
+    private int decodeCursor(String cursor) {
+        if (cursor == null || cursor.isBlank()) {
+            return 0;
+        }
+        try {
+            return Integer.parseInt(new String(Base64.getUrlDecoder().decode(cursor), StandardCharsets.UTF_8));
+        } catch (Exception e) {
+            throw new ApiException(HttpStatus.BAD_REQUEST, "INVALID_CURSOR", "分页游标非法");
+        }
+    }
+
+    private String encodeCursor(int offset) {
+        return Base64.getUrlEncoder().withoutPadding()
+                .encodeToString(Integer.toString(offset).getBytes(StandardCharsets.UTF_8));
+    }
+
+    private PageData loadCachedPage(String key, java.util.function.Supplier<PageData> loader) {
+        long now = System.currentTimeMillis();
+        CachedPage current = listCache.get(key);
+        if (current != null && current.expiresAt() > now) {
+            return await(current.future());
+        }
+        CachedPage candidate = new CachedPage(new CompletableFuture<>(), now + LIST_CACHE_TTL_MILLIS);
+        if (current == null) {
+            CachedPage previous = listCache.putIfAbsent(key, candidate);
+            current = previous == null ? candidate : previous;
+        } else if (listCache.replace(key, current, candidate)) {
+            current = candidate;
+        } else {
+            current = listCache.get(key);
+        }
+        if (current != candidate) {
+            return await(current.future());
+        }
+        try {
+            PageData value = loader.get();
+            candidate.future().complete(value);
+            trimListCache();
+            return value;
+        } catch (RuntimeException e) {
+            candidate.future().completeExceptionally(e);
+            listCache.remove(key, candidate);
+            throw e;
+        }
+    }
+
+    private PageData await(CompletableFuture<PageData> future) {
+        try {
+            return future.get();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("delivery list query interrupted", e);
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof RuntimeException runtime) {
+                throw runtime;
+            }
+            throw new IllegalStateException("delivery list query failed", cause);
+        }
+    }
+
+    private void trimListCache() {
+        if (listCache.size() <= LIST_CACHE_MAX_ENTRIES) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        listCache.entrySet().removeIf(entry -> entry.getValue().expiresAt() <= now);
+        while (listCache.size() > LIST_CACHE_MAX_ENTRIES) {
+            String key = listCache.keys().hasMoreElements() ? listCache.keys().nextElement() : null;
+            if (key == null || listCache.remove(key) == null) {
+                break;
+            }
+        }
+    }
+
+    private String listCacheKey(Object... values) {
+        return Arrays.stream(values)
+                .map(value -> value == null ? "" : String.valueOf(value))
+                .collect(Collectors.joining("\u001f"));
+    }
+
+    private boolean isBlank(String value) {
+        return value == null || value.isBlank();
+    }
+
+    private record CachedPage(CompletableFuture<PageData> future, long expiresAt) { }
+
+    private record PageData(List<DeliveryItem> data, PageInfo page) { }
+
+    private String id(UUID value) {
+        return value == null ? null : value.toString();
+    }
+
+    private String iso(LocalDateTime value) {
+        return value == null ? null : value.toInstant(ZoneOffset.UTC).toString();
+    }
+}
