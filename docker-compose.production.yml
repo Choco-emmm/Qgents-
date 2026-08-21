@@ -16,7 +16,7 @@ services:
       retries: 20
 
   clash:
-    image: ghcr.io/metacubex/mihomo:latest
+    image: docker.io/metacubex/mihomo:latest
     restart: unless-stopped
     volumes:
       - ./deploy/mihomo:/root/.config/mihomo
