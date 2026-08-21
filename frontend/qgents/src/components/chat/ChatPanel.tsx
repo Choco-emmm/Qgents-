@@ -26,6 +26,7 @@ import { getApiBaseUrl } from '@/api/client'
 import { useAuth } from '@/context/AuthContext'
 import { useAgents } from '@/hooks/agents'
 import { subscribeRealtimeReconnect } from '@/realtime'
+import { useProjectTaskPollingInterval } from '@/realtime/useProjectTaskDomainEvents'
 import { ErrorBoundary } from '@/components/ErrorBoundary'
 import { TaskTriggerModal } from '@/components/task-domain'
 import { GroupMemberSettings } from '@/pages/ProjectDetail/GroupMemberSettings'
@@ -94,6 +95,7 @@ export function ChatPanel({ projectId, groupId }: { projectId: string; groupId: 
   const inputRef = useRef<TextAreaRef>(null)
   // 右键成员消息的上下文菜单（@ta）：记录触发位置与目标消息
   const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number; message: Message } | null>(null)
+  const taskPollingInterval = useProjectTaskPollingInterval(projectId, 5_000)
 
   const { data: groups = [] } = useQuery({
     queryKey: ['groups', projectId],
@@ -133,7 +135,7 @@ export function ChatPanel({ projectId, groupId }: { projectId: string; groupId: 
     queryKey: taskModelQueryKeys.tasks.list(projectId, { limit: 100 }),
     queryFn: () => tasksApi.list(projectId, { limit: 100 }),
     enabled: !!projectId,
-    refetchInterval: 5_000,
+    refetchInterval: taskPollingInterval,
   })
   const taskStatusById = new Map((taskPage?.data ?? []).map((task) => [task.id, task.status]))
   const teamId = project?.teamId
@@ -780,15 +782,16 @@ export function ChatPanel({ projectId, groupId }: { projectId: string; groupId: 
       } else if (hasAgentMention && canOpenTaskTrigger) {
         try {
           const repositories = await githubApi.listProjectRepositories(projectId)
-          const baseRef = repositories[0]?.defaultBranch
-          if (repositories.length === 0 || !baseRef) {
+          if (repositories.length === 0) {
             throw new Error('当前项目没有可用于创建任务的绑定仓库。')
           }
+          // @agent 自动触发不指定公共基线分支：每个仓库用各自项目默认分支兜底，
+          // 避免「仓库 A 用 develop、仓库 B 用 master」时单一 baseRef 导致 409 GIT_BRANCH_NOT_FOUND。
           await groupApi.triggerTask(projectId, groupId, sentMessage.id, {
             title: taskTitleFromMessage(text),
             requirement: text,
             repositoryIds: repositories.map((repository) => repository.id),
-            baseRef,
+            baseRef: null,
           })
           void queryClient.invalidateQueries({ queryKey: ['qgents', 'projects', projectId, 'tasks'] })
           message.success('任务已创建，正在生成执行方案。')
