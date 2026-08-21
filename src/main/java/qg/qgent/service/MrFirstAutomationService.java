@@ -9,6 +9,7 @@ import org.springframework.transaction.event.TransactionPhase;
 import org.springframework.transaction.event.TransactionalEventListener;
 import qg.qgent.dto.MergeRequestCreateRequest;
 import qg.qgent.dto.MergeRequestSummaryResponse;
+import qg.qgent.api.ApiException;
 import qg.qgent.entity.DryRunEntity;
 import qg.qgent.entity.MrPreflightRequestEntity;
 import qg.qgent.entity.ProjectRepositoryEntity;
@@ -185,6 +186,10 @@ public class MrFirstAutomationService {
 
     private boolean isGitRepositoryLockFailure(Throwable failure) {
         for (Throwable current = failure; current != null; current = current.getCause()) {
+            if (current instanceof ApiException apiException
+                    && "GIT_REPOSITORY_LOCK_FAILED".equals(apiException.code())) {
+                return true;
+            }
             String message = current.getMessage();
             if (message != null && (message.contains("GIT_REPOSITORY_LOCK_FAILED")
                     || message.toLowerCase(java.util.Locale.ROOT).contains("cannot lock shared git repository"))) {
