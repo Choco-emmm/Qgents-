@@ -43,9 +43,12 @@ services:
       dockerfile: sandbox-worker/Dockerfile.production
     restart: unless-stopped
     environment:
-      SANDBOX_DB_URL: jdbc:mysql://${DB_HOST:-host.docker.internal}:${DB_PORT:-3306}/qgents_sandbox_worker?useUnicode=true&characterEncoding=utf8&serverTimezone=UTC
-      SANDBOX_DB_USERNAME: ${DB_USERNAME:-qgents}
-      SANDBOX_DB_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD}
+      SANDBOX_DB_URL: jdbc:mysql://${DB_HOST:-172.17.0.1}:${DB_PORT:-3306}/qgents_sandbox_worker?useUnicode=true&characterEncoding=utf8&serverTimezone=UTC
+      SANDBOX_DB_USERNAME: ${SANDBOX_DB_USERNAME:-root}
+      SANDBOX_DB_PASSWORD: ${SANDBOX_DB_PASSWORD:?Set SANDBOX_DB_PASSWORD}
+      HTTP_PROXY: http://${PROXY_HOST:-clash}:${PROXY_PORT:-7890}
+      HTTPS_PROXY: http://${PROXY_HOST:-clash}:${PROXY_PORT:-7890}
+      NO_PROXY: localhost,127.0.0.1,host.docker.internal,redis,api,sandbox-worker,clash
       SANDBOX_RUNTIME: docker
       SANDBOX_DOCKER_HOST: unix:///var/run/docker.sock
       SANDBOX_DEV_TOOLS_IMAGE: qgents/sandbox-dev-tools:production
@@ -56,14 +59,13 @@ services:
       SANDBOX_WORKSPACE_DOCKER_HOST_ROOT: /srv/qgents/workspaces
       SANDBOX_WORKSPACE_METADATA_ROOT: /srv/qgents/workspace-metadata
       SANDBOX_WORKER_ID: production-worker-1
-      HTTP_PROXY: http://${PROXY_HOST:-clash}:${PROXY_PORT:-7890}
-      HTTPS_PROXY: http://${PROXY_HOST:-clash}:${PROXY_PORT:-7890}
-      NO_PROXY: localhost,127.0.0.1,host.docker.internal,redis,api,sandbox-worker,clash
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ${QGENTS_DATA_ROOT:-/srv/qgents}/git-store:/var/lib/qgents/git-store
       - ${QGENTS_DATA_ROOT:-/srv/qgents}/workspaces:/srv/qgents/workspaces
       - ${QGENTS_DATA_ROOT:-/srv/qgents}/workspace-metadata:/srv/qgents/workspace-metadata
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     group_add:
       - "${DOCKER_GID:-999}"
     expose: ["8091"]
@@ -74,6 +76,7 @@ services:
       timeout: 5s
       retries: 20
     depends_on:
+      clash: {condition: service_healthy}
       sandbox-dev-tools: {condition: service_started}
 
   api:
@@ -82,15 +85,15 @@ services:
       dockerfile: Dockerfile.production
     restart: unless-stopped
     environment:
-      DB_URL: jdbc:mysql://${DB_HOST:-host.docker.internal}:${DB_PORT:-3306}/qgents?useUnicode=true&characterEncoding=utf8&serverTimezone=UTC
-      DB_USERNAME: ${DB_USERNAME:-qgents}
+      DB_URL: jdbc:mysql://${DB_HOST:-172.17.0.1}:${DB_PORT:-3306}/qgents?useUnicode=true&characterEncoding=utf8&serverTimezone=UTC
+      DB_USERNAME: ${DB_USERNAME:-root}
       DB_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD}
-      REDIS_HOST: redis
-      REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD}
       SMTP_HOST: ${SMTP_HOST:-smtp.qq.com}
       SMTP_PORT: ${SMTP_PORT:-465}
       SMTP_USERNAME: ${SMTP_USERNAME:?Set SMTP_USERNAME}
       SMTP_AUTH_CODE: ${SMTP_AUTH_CODE:?Set SMTP_AUTH_CODE}
+      REDIS_HOST: redis
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD}
       DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:?Set DASHSCOPE_API_KEY}
       JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET}
       SANDBOX_WORKER_URL: http://sandbox-worker:8091
@@ -104,12 +107,12 @@ services:
       GITHUB_APP_CALLBACK_URL: ${GITHUB_APP_CALLBACK_URL:?Set GITHUB_APP_CALLBACK_URL}
       GITHUB_APP_STATE_SECRET: ${GITHUB_APP_STATE_SECRET:?Set GITHUB_APP_STATE_SECRET}
       GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:?Set GITHUB_WEBHOOK_SECRET}
-      APP_AGENT_PROTOCOL: native
       GITHUB_PROXY_HOST: ${PROXY_HOST:-clash}
       GITHUB_PROXY_PORT: ${PROXY_PORT:-7890}
       HTTP_PROXY: http://${PROXY_HOST:-clash}:${PROXY_PORT:-7890}
       HTTPS_PROXY: http://${PROXY_HOST:-clash}:${PROXY_PORT:-7890}
       NO_PROXY: localhost,127.0.0.1,host.docker.internal,redis,api,sandbox-worker,clash
+      APP_AGENT_PROTOCOL: native
       MANAGEMENT_SERVER_ADDRESS: 0.0.0.0
       MANAGEMENT_SERVER_PORT: "8081"
     volumes:
@@ -127,8 +130,8 @@ services:
       timeout: 5s
       retries: 20
     depends_on:
-      redis: {condition: service_healthy}
       clash: {condition: service_healthy}
+      redis: {condition: service_healthy}
       sandbox-worker: {condition: service_healthy}
 
   web:
