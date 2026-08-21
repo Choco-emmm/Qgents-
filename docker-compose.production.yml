@@ -15,20 +15,6 @@ services:
       timeout: 5s
       retries: 20
 
-  clash:
-    image: ghcr.io/metacubex/mihomo:latest
-    restart: unless-stopped
-    volumes:
-      # 配置中的 rule-providers 会把缓存写入 ruleset/，因此目录需要可写。
-      - ./deploy/mihomo:/root/.config/mihomo
-    expose: ["7890"]
-    networks: [backend]
-    healthcheck:
-      test: ["CMD-SHELL", "mihomo -v >/dev/null 2>&1"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-
   sandbox-dev-tools:
     build:
       context: ./sandbox-images/dev-tools
@@ -54,9 +40,9 @@ services:
       SANDBOX_WORKSPACE_DOCKER_HOST_ROOT: /srv/qgents/workspaces
       SANDBOX_WORKSPACE_METADATA_ROOT: /srv/qgents/workspace-metadata
       SANDBOX_WORKER_ID: production-worker-1
-      HTTP_PROXY: http://clash:7890
-      HTTPS_PROXY: http://clash:7890
-      NO_PROXY: localhost,127.0.0.1,host.docker.internal,redis,api,sandbox-worker,clash
+      HTTP_PROXY: http://${PROXY_HOST:-host.docker.internal}:${PROXY_PORT:-7890}
+      HTTPS_PROXY: http://${PROXY_HOST:-host.docker.internal}:${PROXY_PORT:-7890}
+      NO_PROXY: localhost,127.0.0.1,host.docker.internal,redis,api,sandbox-worker
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ${QGENTS_DATA_ROOT:-/srv/qgents}/git-store:/var/lib/qgents/git-store
@@ -65,6 +51,8 @@ services:
     group_add:
       - "${DOCKER_GID:-999}"
     expose: ["8091"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     networks: [backend]
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8091/actuator/health | grep -q UP"]
@@ -101,11 +89,11 @@ services:
       GITHUB_APP_STATE_SECRET: ${GITHUB_APP_STATE_SECRET:?Set GITHUB_APP_STATE_SECRET}
       GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:?Set GITHUB_WEBHOOK_SECRET}
       APP_AGENT_PROTOCOL: native
-      GITHUB_PROXY_HOST: clash
-      GITHUB_PROXY_PORT: "7890"
-      HTTP_PROXY: http://clash:7890
-      HTTPS_PROXY: http://clash:7890
-      NO_PROXY: localhost,127.0.0.1,host.docker.internal,redis,api,sandbox-worker,clash
+      GITHUB_PROXY_HOST: ${PROXY_HOST:-host.docker.internal}
+      GITHUB_PROXY_PORT: ${PROXY_PORT:-7890}
+      HTTP_PROXY: http://${PROXY_HOST:-host.docker.internal}:${PROXY_PORT:-7890}
+      HTTPS_PROXY: http://${PROXY_HOST:-host.docker.internal}:${PROXY_PORT:-7890}
+      NO_PROXY: localhost,127.0.0.1,host.docker.internal,redis,api,sandbox-worker
       MANAGEMENT_SERVER_ADDRESS: 0.0.0.0
       MANAGEMENT_SERVER_PORT: "8081"
     volumes:
@@ -123,7 +111,6 @@ services:
       retries: 20
     depends_on:
       redis: {condition: service_healthy}
-      clash: {condition: service_healthy}
       sandbox-worker: {condition: service_healthy}
 
   web:
