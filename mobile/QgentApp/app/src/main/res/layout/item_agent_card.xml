@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:layout_width="80dp"
+    android:layout_height="wrap_content"
+    android:gravity="center"
+    android:orientation="vertical"
+    android:padding="8dp">
+
+    <FrameLayout
+        android:layout_width="56dp"
+        android:layout_height="56dp">
+
+        <ImageView
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:background="@drawable/bg_avatar"
+            android:contentDescription="@string/avatar"
+            android:src="@drawable/ic_person" />
+
+        <!-- 状态指示灯 -->
+        <View
+            android:id="@+id/vStatusDot"
+            android:layout_width="12dp"
+            android:layout_height="12dp"
+            android:layout_gravity="bottom|end"
+            android:layout_marginEnd="2dp"
+            android:layout_marginBottom="2dp"
+            android:background="@drawable/bg_status_dot"
+            tools:backgroundTint="#05DEBA" />
+    </FrameLayout>
+
+    <TextView
+        android:id="@+id/tvAgentName"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="6dp"
+        android:ellipsize="end"
+        android:maxLines="1"
+        android:textColor="?android:attr/textColorPrimary"
+        android:textSize="12sp"
+        tools:text="Planner" />
+
+    <TextView
+        android:id="@+id/tvAgentRole"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="1dp"
+        android:background="@drawable/bg_status_tag"
+        android:gravity="center"
+        android:paddingStart="5dp"
+        android:paddingTop="1dp"
+        android:paddingEnd="5dp"
+        android:paddingBottom="1dp"
+        android:textColor="@color/white"
+        android:textSize="9sp"
+        tools:text="规划者" />
+
+    <!-- 能力标签：最多显示 2 个，超出省略号 -->
+    <TextView
+        android:id="@+id/tvAgentCaps"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="2dp"
+        android:ellipsize="end"
+        android:maxLines="1"
+        android:textColor="@color/slate_gray"
+        android:textSize="9sp"
+        tools:text="需求分析 · 任务拆分" />
+
+    <TextView
+        android:id="@+id/tvAgentStatus"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="2dp"
+        android:textColor="@color/text_secondary"
+        android:textSize="10sp"
+        tools:text="闲置" />
+</LinearLayout>

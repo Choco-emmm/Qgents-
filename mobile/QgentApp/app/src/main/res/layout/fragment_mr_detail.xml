@@ -1,0 +1,258 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- MR 详情页：MR 信息 + diff 变更文件与代码 -->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/off_white"
+    android:orientation="vertical"
+    tools:context=".ui.tasks.MergeRequestDetailFragment">
+
+    <!-- 顶部栏 -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:background="@color/navy"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:paddingStart="8dp"
+        android:paddingTop="10dp"
+        android:paddingEnd="16dp"
+        android:paddingBottom="10dp">
+
+        <ImageButton
+            android:id="@+id/ivBack"
+            android:layout_width="45dp"
+            android:layout_height="45dp"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            android:contentDescription="@string/action_back"
+            android:src="@drawable/ic_back"
+            app:tint="@color/blue_tint" />
+
+        <TextView
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="合并请求详情"
+            android:textAppearance="@style/TextAppearance.Material3.HeadlineSmall"
+            android:textColor="@color/blue_tint"
+            android:textStyle="bold" />
+    </LinearLayout>
+
+    <FrameLayout
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1">
+
+    <ScrollView
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:fillViewport="true">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:padding="16dp">
+
+            <!-- MR 标题 -->
+            <TextView
+                android:id="@+id/tvMrTitle"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:textColor="@color/text_primary"
+                android:textSize="25sp"
+                android:textStyle="bold"
+                tools:text="#42 实现邮箱登录" />
+
+            <!-- 状态 -->
+            <TextView
+                android:id="@+id/tvMrStatus"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:background="@drawable/bg_status_tag"
+                android:gravity="center"
+                android:paddingStart="8dp"
+                android:paddingTop="4dp"
+                android:paddingEnd="8dp"
+                android:paddingBottom="4dp"
+                android:textColor="@color/white"
+                android:textSize="15sp"
+                tools:text="进行中" />
+
+            <!-- 仓库 + 分支 -->
+            <TextView
+                android:id="@+id/tvMrRepo"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:drawablePadding="6dp"
+                android:textColor="@color/text_secondary"
+                android:textSize="15sp"
+                app:drawableStartCompat="@drawable/ic_folder"
+                app:drawableTint="@color/text_secondary"
+                tools:text="auth-service" />
+
+            <TextView
+                android:id="@+id/tvMrBranches"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:textColor="@color/text_secondary"
+                android:textSize="15sp"
+                tools:text="feature/login-api → main" />
+
+            <View
+                android:layout_width="match_parent"
+                android:layout_height="1dp"
+                android:layout_marginTop="16dp"
+                android:background="@color/divider" />
+
+            <!-- 交付流程（diff 审核之后：DryRun / CQ+1 / 合并 / 同步） -->
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:text="交付流程"
+                android:textColor="@color/text_primary"
+                android:textSize="20sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/tvFlowChecks"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:lineSpacingExtra="3dp"
+                android:textColor="@color/text_secondary"
+                android:textSize="13sp"
+                tools:text="DryRun ✓ · AI Review ✓ · CQ+1 待审批" />
+
+            <TextView
+                android:id="@+id/tvFlowReviews"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:textColor="@color/text_secondary"
+                android:textSize="13sp"
+                tools:text="CQ+1：张三 ✓" />
+
+            <!-- 操作按钮（按状态/权限显示；后端鉴权兜底） -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:orientation="horizontal">
+
+                <TextView
+                    android:id="@+id/btnCqApprove"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:background="@drawable/bg_status_tag"
+                    android:gravity="center"
+                    android:paddingStart="12dp"
+                    android:paddingTop="6dp"
+                    android:paddingEnd="12dp"
+                    android:paddingBottom="6dp"
+                    android:text="CQ+1"
+                    android:textColor="@color/white"
+                    android:textSize="13sp"
+                    android:visibility="gone" />
+
+                <TextView
+                    android:id="@+id/btnCqReject"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="8dp"
+                    android:background="@drawable/bg_status_tag"
+                    android:gravity="center"
+                    android:paddingStart="12dp"
+                    android:paddingTop="6dp"
+                    android:paddingEnd="12dp"
+                    android:paddingBottom="6dp"
+                    android:text="拒绝 CQ"
+                    android:textColor="@color/white"
+                    android:textSize="13sp"
+                    android:visibility="gone" />
+
+                <TextView
+                    android:id="@+id/btnMerge"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="8dp"
+                    android:background="@drawable/bg_status_tag"
+                    android:gravity="center"
+                    android:paddingStart="12dp"
+                    android:paddingTop="6dp"
+                    android:paddingEnd="12dp"
+                    android:paddingBottom="6dp"
+                    android:text="合并"
+                    android:textColor="@color/white"
+                    android:textSize="13sp"
+                    android:visibility="gone" />
+
+                <TextView
+                    android:id="@+id/btnSync"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="8dp"
+                    android:background="@drawable/bg_status_tag"
+                    android:gravity="center"
+                    android:paddingStart="12dp"
+                    android:paddingTop="6dp"
+                    android:paddingEnd="12dp"
+                    android:paddingBottom="6dp"
+                    android:text="同步"
+                    android:textColor="@color/white"
+                    android:textSize="13sp"
+                    android:visibility="gone" />
+            </LinearLayout>
+
+            <View
+                android:layout_width="match_parent"
+                android:layout_height="1dp"
+                android:layout_marginTop="16dp"
+                android:background="@color/divider" />
+
+            <!-- diff 变更 -->
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:text="代码变更"
+                android:textColor="@color/text_primary"
+                android:textSize="20sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/tvDiffEmpty"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:gravity="center"
+                android:text="暂无代码变更"
+                android:textColor="@color/text_secondary"
+                android:textSize="14sp"
+                android:visibility="gone" />
+
+            <!-- diff 文件容器（fillLinearLayout 填充，避免嵌套 RecyclerView 滚动问题） -->
+            <LinearLayout
+                android:id="@+id/containerDiffFiles"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                />
+        </LinearLayout>
+    </ScrollView>
+
+        <!-- 加载中指示器：数据加载期间显示 -->
+        <ProgressBar
+            android:id="@+id/loading"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="center"
+            android:visibility="gone" />
+    </FrameLayout>
+</LinearLayout>

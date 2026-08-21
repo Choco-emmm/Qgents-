@@ -1,0 +1,139 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="?attr/colorSurface"
+    android:backgroundTint="@color/light_gray"
+    android:orientation="vertical"
+    tools:context=".ui.chat.ChatListFragment">
+
+    <!-- 顶部栏：头像+昵称+团队 | 搜索 | 加号 -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:background="@color/navy"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:paddingStart="12dp"
+        android:paddingTop="20dp"
+        android:paddingEnd="8dp"
+        android:paddingBottom="10dp">
+
+        <FrameLayout
+            android:layout_width="44dp"
+            android:layout_height="44dp">
+
+            <com.google.android.material.imageview.ShapeableImageView
+                android:id="@+id/btnAvatar"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"
+                android:background="@drawable/bg_avatar"
+                android:clickable="true"
+                android:contentDescription="@string/user_name_placeholder"
+                android:focusable="true"
+                android:scaleType="centerCrop"
+                app:shapeAppearanceOverlay="@style/ShapeAppearanceOverlay.App.Avatar"
+                android:src="@drawable/ic_avatar_default"
+                app:strokeColor="@color/white"
+                app:strokeWidth="1dp" />
+
+            <!-- 未读团队邀请红点 -->
+            <View
+                android:id="@+id/ivInviteBadge"
+                android:layout_width="10dp"
+                android:layout_height="10dp"
+                android:layout_gravity="top|end"
+                android:background="@drawable/bg_unread_badge"
+                android:visibility="gone" />
+        </FrameLayout>
+
+        <LinearLayout
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="10dp"
+            android:orientation="vertical">
+
+            <TextView
+                android:id="@+id/tvUserName"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:textColor="@color/white"
+                android:textSize="20sp"
+                android:textStyle="bold"
+                tools:text="@string/user_name_placeholder" />
+
+            <TextView
+                android:id="@+id/tvTeamName"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="2dp"
+                android:textColor="@color/blue_tint"
+                android:textSize="15sp"
+                tools:text="@string/team_name_placeholder" />
+        </LinearLayout>
+
+        <Space
+            android:layout_width="0dp"
+            android:layout_height="1dp"
+            android:layout_weight="1" />
+
+        <ImageButton
+            android:id="@+id/btnSearch"
+            android:layout_width="40dp"
+            android:layout_height="40dp"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            android:contentDescription="@string/search_placeholder"
+            android:src="@drawable/ic_search"
+            app:tint="@color/white" />
+
+        <ImageButton
+            android:id="@+id/btnAdd"
+            android:layout_width="44dp"
+            android:layout_height="44dp"
+            android:layout_marginStart="4dp"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            android:contentDescription="@string/nav_chat"
+            android:src="@drawable/ic_add"
+            app:tint="@color/white" />
+    </LinearLayout>
+
+    <!-- 群聊列表（数据未接入，先显示空态） -->
+    <FrameLayout
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1">
+
+        <!-- 下拉刷新容器：包裹群聊列表 -->
+        <androidx.swiperefreshlayout.widget.SwipeRefreshLayout
+            android:id="@+id/swipeRefresh"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent">
+
+            <androidx.recyclerview.widget.RecyclerView
+                android:id="@+id/rvChatList"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"
+                android:clipToPadding="false"
+                />
+        </androidx.swiperefreshlayout.widget.SwipeRefreshLayout>
+
+        <TextView
+            android:id="@+id/tvChatListEmpty"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="center"
+            android:text="@string/chat_list_empty"
+            android:textColor="@color/text_secondary" />
+
+        <!-- 群聊列表加载中指示器：切换项目加载期间显示 -->
+        <ProgressBar
+            android:id="@+id/loading"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="center"
+            android:visibility="gone" />
+    </FrameLayout>
+
+</LinearLayout>

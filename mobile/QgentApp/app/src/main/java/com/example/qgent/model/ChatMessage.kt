@@ -1,0 +1,76 @@
+package com.example.qgent.model
+
+enum class MessageType { TEXT, CODE, IMAGE, FILE, SYSTEM, QUOTE, DIFF, TASK_STATUS }
+
+/** 消息发送状态：SENDING 显示小加载标，FAILED 显示红色感叹号（可点击重发/删除）；null 表示已发送成功或无状态 */
+enum class SendState { SENDING, FAILED }
+
+data class ChatMessage(
+    val id: String,
+    /** 发送者 id（USER=userId / AGENT=agentId），用于反查成员头像 */
+    val senderId: String? = null,
+    val senderName: String,
+    val content: String,
+    val type: MessageType,
+    val timestamp: Long,
+    val isMine: Boolean,
+    val diff: List<DiffFile>? = null,
+    val fileName: String? = null,
+    val fileSize: Long? = null,
+    val sequence: Long = 0,
+    /** 引用消息：被引用消息 id + 展示摘要（非空表示本条为 QUOTE） */
+    val replyToId: String? = null,
+    val replyToSummary: String? = null,
+    /** 发送者类型：USER / AGENT / SYSTEM（文档 §7；Agent 消息用于视觉区分） */
+    val senderType: String? = null,
+    /** TASK_STATUS 卡片：状态 + 执行节点 + 关联任务 id（文档 §7 content 含 taskId/status/node/message） */
+    val taskId: String? = null,
+    val taskStatus: String? = null,
+    val taskNode: String? = null,
+    /** TASK_STATUS 卡片（v23）：阶段 / 交付模式 / 计划摘要 / 步骤快照 */
+    val taskPhase: String? = null,
+    val taskDeliveryMode: String? = null,
+    val taskPlanSummary: String? = null,
+    val taskPlanSteps: List<TaskStepSnapshot>? = null,
+    /** DIFF 卡片：content 含 diffId，展示时用 DiffRepository 拉取文件内容 */
+    val diffId: String? = null,
+    /** DIFF 卡片（v23）：审核批次 / 审核状态 / 交付状态 */
+    val reviewBatchId: String? = null,
+    val reviewStatus: String? = null,
+    val deliveryStatus: String? = null,
+    /** DIFF 卡：任务标题（content.title，服务端保证必有，§v1.9.4 DIFF 卡契约） */
+    val diffTitle: String? = null,
+    /** DIFF 卡：总变更统计（content.additions / content.deletions） */
+    val diffAdditions: Int? = null,
+    val diffDeletions: Int? = null,
+    // ── 附件内联预览（契约 v0.1）：IMAGE/FILE 消息必填 attachmentId；预览字段由后端回填或前端按需调 preview-url ──
+    val attachmentId: String? = null,
+    val previewable: Boolean? = null,
+    val previewType: String? = null,
+    /** 签名预览 URL（相对路径，带短期 token）；不落 Room 缓存（§2.2：含 token URL 不得长期持久化），过期后重新获取 */
+    val previewUrl: String? = null,
+    /** 下载地址（附件语义）；previewUrl 过期或 UNSUPPORTED 时用 */
+    val downloadUrl: String? = null,
+    /** 发送状态（仅自己发送的消息有效）：发送中 / 失败 */
+    val sendState: SendState? = null,
+    /** 发送失败原因（后端错误码/文案，仅 FAILED 时可能非空，用于重发弹窗展示） */
+    val sendError: String? = null,
+    /** 本条消息 @ 提及的 id 列表（USER=userId / AGENT=agentId，§7.1 通知直达兜底定位用） */
+    val mentionIds: List<String>? = null,
+    /**
+     * 客户端幂等键（§7：同一群内唯一，断线重试命中返回原消息）。
+     * 本地乐观消息生成后固定不变，重发/断线重试复用同一值 → 后端幂等去重，不产生重复消息。
+     */
+    val clientMessageId: String? = null
+) {
+    fun displayContent(): String = when (type) {
+        MessageType.TEXT, MessageType.CODE -> content
+        MessageType.IMAGE -> "[图片]"
+        MessageType.FILE -> fileName ?: "[文件]"
+        MessageType.SYSTEM -> content
+        // v2.0.4：QUOTE 消息 content.text 为消息自身正文（引用条已单独展示被引用摘要）
+        MessageType.QUOTE -> content.ifBlank { replyToSummary?.let { "引用：$it" } ?: "[引用消息]" }
+        MessageType.DIFF -> "[代码变更]"
+        MessageType.TASK_STATUS -> content.ifBlank { "[任务状态] " }
+    }
+}

@@ -1,0 +1,100 @@
+package com.example.qgent.data.sse
+
+/**
+ * SSE 事件（文档 §12.1 + 项目/团队/通知级补充）。
+ *
+ * `id` 即流内单调递增 sequenceNo，作为 Last-Event-ID 断线续传游标；
+ * `type` 为事件名（如 task.updated / message.created），`data` 为业务 payload 原始 JSON。
+ *
+ * 事件仅用于刷新界面：客户端恢复连接或收到乱序事件后，
+ * 必须以对应的查询接口为准，不把 SSE payload 当作完整 DTO。
+ */
+data class SseEvent(
+    val id: String?,
+    val type: SseEventType,
+    val data: String
+)
+
+/**
+ * 全部事件类型（按流分组）。
+ *
+ * 项目级流（GET /projects/{projectId}/events）：任务/Diff/交付 + 消息/群/Memory；
+ * 团队级流（GET /teams/{teamId}/events）：成员/项目动态。
+ */
+enum class SseEventType(val wire: String) {
+
+    // ── 项目级：任务 / Diff / 交付（§12.1 + §15.4） ──
+
+    TASK_UPDATED("task.updated"),
+    TASK_STEP_UPDATED("task-step.updated"),
+    TASK_RUN_UPDATED("task-run.updated"),
+    TASK_RUN_STEP_PROGRESS("task-run.step.progress"),
+    INPUT_REQUIRED("input-required"),
+    APPROVAL_REQUIRED("approval-required"),
+    TEST_RUN_UPDATED("test-run.updated"),
+    DRY_RUN_UPDATED("dry-run.updated"),
+    /** 预检状态或 CQ+1 变化（统一创建 MR 自动预检；payload 含 taskId/repositoryId 等） */
+    PREFLIGHT_UPDATED("preflight.updated"),
+    DIFF_CREATED("diff.created"),
+    TASK_ARTIFACT_CREATED("task.artifact.created"),
+    TASK_RUN_ARTIFACT_CREATED("task-run.artifact.created"),
+    DIFF_REVIEW_CREATED("diff-review.created"),
+    TASK_AWAITING_DIFF_CONFIRMATION("task.awaiting-diff-confirmation"),
+    DIFF_REVIEW_CONFIRMED("diff-review.confirmed"),
+    DIFF_REVIEW_REJECTED("diff-review.rejected"),
+    /** 当前 Diff 已被同一 Workspace 的后续修改取代，必须刷新任务详情后以新状态渲染。 */
+    DIFF_REVIEW_SUPERSEDED("diff-review.superseded"),
+    /**
+     * 自动交付开始（MR_FIRST B 方案，§v1.10.0）。
+     * payload { projectId, taskId, reviewBatchId, deliveryMode, operationId, reason? }；
+     * 收到后立即刷新 Task + DiffReview（以 taskId+operationId 去重，不把事件当作交付成功）。
+     */
+    DELIVERY_STARTED("delivery.started"),
+    DELIVERY_REPOSITORY_UPDATED("delivery.repository.updated"),
+    DELIVERY_FAILED("delivery.failed"),
+    DELIVERY_COMPLETED("delivery.completed"),
+    TASK_DIFF_REVIEW_FAILED("task.diff-review.failed"),
+    DIFF_REVIEW_SKIPPED("diff-review.skipped"),
+    MERGE_REQUEST_UPDATED("merge-request.updated"),
+    /** 工作分支状态变化（GitHub Webhook 处理后发布）：MR 打开锁定分支 / 合并后解锁 / canContinueDevelopment / 分支开发状态变化 */
+    WORK_BRANCH_UPDATED("work-branch.updated"),
+    /** GitHub 仓库状态变化（撤销授权 / 归档 / 恢复授权）；收到后刷新仓库列表与授权状态 */
+    GITHUB_REPOSITORY_UPDATED("github-repository.updated"),
+    /** GitHub App/Installation 状态变化（暂停 / 删除 / 恢复）；收到后刷新团队仓库与安装状态 */
+    GITHUB_INSTALLATION_UPDATED("github-installation.updated"),
+    /** Workspace 实时 Diff Preview 更新（Coding 写入后累计工作树变化；payload 只含元数据，patch 走 REST） */
+    WORKSPACE_DIFF_PREVIEW_UPDATED("workspace.diff-preview.updated"),
+
+    // ── 项目级：消息 / 群 / Memory（前端 SSE 需求清单 ①） ──
+
+    /** 有人/Agent 发群消息；payload { projectId, groupId, messageId } */
+    MESSAGE_CREATED("message.created"),
+    /** v23：已有群消息 content 被更新（TASK_STATUS/DIFF 卡单消息持续更新）；payload { projectId, groupId, messageId } */
+    MESSAGE_UPDATED("message.updated"),
+    /** 群创建/改名/归档；payload { projectId, groupId } */
+    GROUP_CREATED("group.created"),
+    GROUP_UPDATED("group.updated"),
+    GROUP_ARCHIVED("group.archived"),
+    /** 成员进出、Agent 首次进群；payload { projectId, groupId } */
+    GROUP_MEMBER_UPDATED("group.member.updated"),
+    /** Memory 审批流转；payload { projectId, resourceType, resourceId, eventVersion, updatedAt } */
+    MEMORY_SUBMIT_REVIEW("memory.submit-review"),
+    MEMORY_APPROVED("memory.approved"),
+    MEMORY_REJECTED("memory.rejected"),
+    MEMORY_ARCHIVED("memory.archived"),
+
+    // ── 团队级（GET /teams/{teamId}/events，清单 ②） ──
+
+    /** 成员被拉进项目；payload { teamId, projectId } */
+    PROJECT_MEMBER_ADDED("project.member.added"),
+    /** 成员加入（接受邀请）/移出团队；payload { teamId, userId } */
+    TEAM_MEMBER_UPDATED("team.member.updated"),
+    /** 团队动态产生（暂未单独发布，由项目事件聚合）；payload { teamId } */
+    ACTIVITY_CREATED("activity.created");
+
+    companion object {
+        /** 未知事件名 → null（不做匹配，避免枚举增长破坏解析） */
+        fun fromWire(name: String): SseEventType? =
+            entries.firstOrNull { it.wire == name }
+    }
+}

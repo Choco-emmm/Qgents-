@@ -1,0 +1,364 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 任务详情页：标题 + 需求 + 状态 + 仓库 -->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/light_gray"
+    android:orientation="vertical"
+    tools:context=".ui.tasks.TaskDetailFragment">
+
+    <!-- 顶部栏 -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:background="@color/navy"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:paddingStart="8dp"
+        android:paddingTop="10dp"
+        android:paddingEnd="16dp"
+        android:paddingBottom="10dp">
+
+        <ImageButton
+            android:id="@+id/ivBack"
+            android:layout_width="45dp"
+            android:layout_height="45dp"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            android:contentDescription="@string/action_back"
+            android:src="@drawable/ic_back"
+            app:tint="@color/blue_tint" />
+
+        <TextView
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="任务详情"
+            android:textAppearance="@style/TextAppearance.Material3.HeadlineSmall"
+            android:textColor="@color/blue_tint"
+            android:textStyle="bold" />
+    </LinearLayout>
+
+    <FrameLayout
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1">
+
+    <ScrollView
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:fillViewport="true">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:padding="15dp">
+
+            <!-- 标题 -->
+            <TextView
+                android:id="@+id/tvTitle"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:textColor="@color/text_primary"
+                android:textSize="25sp"
+                android:textStyle="bold"
+                tools:text="实现邮箱登录" />
+
+            <!-- 状态 -->
+            <TextView
+                android:id="@+id/tvStatus"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:background="@drawable/bg_status_tag"
+                android:gravity="center"
+                android:paddingStart="8dp"
+                android:paddingTop="4dp"
+                android:paddingEnd="8dp"
+                android:paddingBottom="4dp"
+                android:textColor="@color/white"
+                android:textSize="16sp"
+                tools:text="执行中" />
+
+            <!-- 交付模式：MR_FIRST=⚡自动交付 / DIFF_FIRST=📦代码交付，deliveryReason 作为副文案（§15） -->
+            <TextView
+                android:id="@+id/tvDeliveryMode"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:textColor="@color/text_secondary"
+                android:textSize="16sp"
+                android:visibility="gone"
+                tools:text="⚡ 自动交付" />
+
+            <!-- 无代码变更空态：FINAL_DIFF_EMPTY（文档 §20.3） -->
+            <TextView
+                android:id="@+id/tvNoCodeChange"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:drawablePadding="6dp"
+                android:text="@string/task_no_code_change"
+                android:textColor="@color/text_secondary"
+                android:textSize="16sp"
+                android:visibility="gone"
+                tools:text="✅ 已完成，无代码变更（未生成 Diff / MR）" />
+
+            <!-- 交付进度总览（批次级 deliveryStatus 稳定文案） -->
+            <TextView
+                android:id="@+id/tvDeliveryStatus"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:textColor="@color/text_primary"
+                android:textSize="15sp"
+                android:textStyle="bold"
+                android:visibility="gone"
+                tools:text="部分仓库成功，部分仓库失败" />
+
+            <!-- 逐仓库交付进度（repositoryDeliveries[]） -->
+            <LinearLayout
+                android:id="@+id/rvRepoDeliveries"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+
+                android:orientation="vertical" />
+
+            <!-- Diff 入口行：左「实时预览」+ 右「查看 Diff 审核」（正式 Diff 语义分离，并排展示） -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
+
+                <!-- 实时预览入口（Workspace Diff Preview，执行中累计工作树变化；无数据隐藏） -->
+                <TextView
+                    android:id="@+id/tvPreviewEntry"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:background="@drawable/bg_status_tag"
+                    android:gravity="center"
+                    android:paddingStart="8dp"
+                    android:paddingTop="6dp"
+                    android:paddingEnd="8dp"
+                    android:paddingBottom="6dp"
+                    android:text="@string/task_realtime_preview"
+                    android:textColor="@color/white"
+                    android:textSize="13sp"
+                    android:visibility="gone" />
+
+                <!-- 正式 Diff 审核入口（diffReviewSummary.available=true 时展示，点击弹审核面板） -->
+                <TextView
+                    android:id="@+id/tvDiffReviewEntry"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="8dp"
+                    android:layout_weight="1"
+                    android:background="@drawable/bg_status_tag"
+                    android:gravity="center"
+                    android:paddingStart="8dp"
+                    android:paddingTop="6dp"
+                    android:paddingEnd="8dp"
+                    android:paddingBottom="6dp"
+                    android:text="📋 查看 Diff 审核"
+                    android:textColor="@color/white"
+                    android:textSize="13sp"
+                    android:visibility="gone" />
+            </LinearLayout>
+
+            <!-- 重试交付（交付失败后重试） -->
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btnRetryDelivery"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:minHeight="36dp"
+                android:paddingStart="14dp"
+                android:paddingEnd="14dp"
+                android:text="@string/retry_delivery"
+                android:textColor="@color/white"
+                android:textSize="14sp"
+                android:visibility="gone"
+                app:backgroundTint="@color/navy"
+                app:cornerRadius="18dp" />
+
+            <!-- 仓库 -->
+            <TextView
+                android:id="@+id/tvRepo"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:drawablePadding="6dp"
+                android:textColor="@color/text_secondary"
+                android:textSize="16sp"
+                app:drawableStartCompat="@drawable/ic_folder"
+                app:drawableTint="@color/text_secondary"
+                tools:text="仓库：auth-service" />
+
+            <View
+                android:layout_width="match_parent"
+                android:layout_height="1dp"
+                android:layout_marginTop="16dp"
+                android:background="@color/divider" />
+
+            <!-- 需求 -->
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="16dp"
+                android:text="🤔 需求"
+                android:textColor="@color/text_primary"
+                android:textSize="18sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/tvRequirement"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:lineSpacingExtra="4dp"
+                android:textColor="@color/text_primary"
+                android:textSize="15sp"
+                tools:text="前后端都要支持，并完成测试。" />
+
+            <!-- 任务失败原因（FAILED / DELIVERY_FAILED 统一展示，后端按 45 节统一组装 code+summary；
+                 位于需求与任务步骤之间） -->
+            <LinearLayout
+                android:id="@+id/layoutFailureReason"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:visibility="gone">
+
+                <TextView
+                    android:id="@+id/tvFailureTitle"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="16dp"
+                    android:text="⚠️ 失败原因"
+                    android:textColor="@color/exit_red"
+                    android:textSize="18sp"
+                    android:textStyle="bold" />
+
+                <TextView
+                    android:id="@+id/tvFailureReason"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:lineSpacingExtra="4dp"
+                    android:textColor="@color/text_primary"
+                    android:textSize="15sp"
+                    tools:text="Agent 执行登录接口开发失败：依赖服务启动超时" />
+
+                <!-- 重新发起任务（GIT_BRANCH_NOT_FOUND：基线分支不存在，跳需求群重新发起） -->
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/btnRestartTask"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:minHeight="36dp"
+                    android:paddingStart="14dp"
+                    android:paddingEnd="14dp"
+                    android:text="@string/restart_task"
+                    android:textColor="@color/white"
+                    android:textSize="14sp"
+                    android:visibility="gone"
+                    app:backgroundTint="@color/navy"
+                    app:cornerRadius="18dp" />
+            </LinearLayout>
+
+            <View
+                android:layout_width="match_parent"
+                android:layout_height="1dp"
+                android:layout_marginTop="16dp"
+                android:background="@color/divider" />
+
+            <!-- 任务步骤列表 -->
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="16dp"
+                android:text="✔️ 任务步骤"
+                android:textColor="@color/text_primary"
+                android:textSize="18sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/tvStepsEmpty"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:gravity="center"
+                android:text="暂无任务步骤"
+                android:textColor="@color/text_secondary"
+                android:textSize="14sp"
+                android:visibility="gone" />
+
+            <LinearLayout
+                android:id="@+id/rvSteps"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical" />
+
+            <View
+                android:layout_width="match_parent"
+                android:layout_height="1dp"
+                android:layout_marginTop="16dp"
+                android:background="@color/divider" />
+
+            <!-- 任务运行列表 -->
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="16dp"
+                android:text="💪 任务运行"
+                android:textColor="@color/text_primary"
+                android:textSize="18sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/tvRunsEmpty"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:gravity="center"
+                android:text="暂无任务运行"
+                android:textColor="@color/text_secondary"
+                android:textSize="14sp"
+                android:visibility="gone" />
+
+            <LinearLayout
+                android:id="@+id/rvRuns"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical" />
+            <!-- 取消任务 -->
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btnCancelTask"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:minHeight="36dp"
+                android:paddingStart="14dp"
+                android:paddingEnd="14dp"
+                android:text="@string/cancel_task"
+                android:textColor="@color/white"
+                android:textSize="14sp"
+                app:backgroundTint="@color/exit_red"
+                app:cornerRadius="18dp" />
+        </LinearLayout>
+    </ScrollView>
+
+        <!-- 加载中指示器：数据加载期间显示 -->
+        <ProgressBar
+            android:id="@+id/loading"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="center"
+            android:visibility="gone" />
+    </FrameLayout>
+</LinearLayout>

@@ -1,0 +1,190 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 共享多选页：邀请成员 / 绑定仓库（mode 参数区分），底部完成按钮 -->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="?android:attr/colorBackground"
+    android:orientation="vertical"
+    tools:context=".ui.personal.ProjectSelectionFragment">
+
+    <!-- ===== 顶部栏 ===== -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:background="@color/navy"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:paddingStart="8dp"
+        android:paddingTop="10dp"
+        android:paddingEnd="16dp"
+        android:paddingBottom="10dp">
+
+        <ImageButton
+            android:id="@+id/ivBack"
+            android:layout_width="45dp"
+            android:layout_height="45dp"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            android:contentDescription="@string/action_back"
+            android:src="@drawable/ic_back"
+            app:tint="@color/blue_tint" />
+
+        <TextView
+            android:id="@+id/tvTitle"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:textAppearance="@style/TextAppearance.Material3.HeadlineSmall"
+            android:textColor="@color/blue_tint"
+            android:textStyle="bold"
+            tools:text="邀请成员" />
+    </LinearLayout>
+
+    <!-- 自动新建仓库（仅 repos 模式显示）：可添加多个仓库名，与勾选已有仓库二选一；
+         个人建仓受个人 GitHub OAuth 状态控制（§50.4）：未授权/非 READY 时置灰并引导去绑定 -->
+    <LinearLayout
+        android:id="@+id/autoCreateSection"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="16dp"
+        android:visibility="gone">
+
+        <!-- OAuth 未就绪：置灰提示 + 去绑定入口（READY 时隐藏） -->
+        <TextView
+            android:id="@+id/tvOauthHint"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center_horizontal"
+            android:lineSpacingExtra="3dp"
+            android:text="@string/auto_create_repo_oauth_locked"
+            android:textColor="@color/red_danger"
+            android:textSize="13sp"
+            android:visibility="gone" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/bnBindGithub"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:minHeight="0dp"
+            android:text="@string/auto_create_repo_bind"
+            android:textSize="14sp"
+            android:visibility="gone"
+            app:backgroundTint="@color/navy_light"
+            app:cornerRadius="8dp" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="@string/auto_create_repo_title"
+            android:textColor="@color/charcoal"
+            android:textSize="16sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:text="@string/auto_create_repo_subtitle"
+            android:textColor="@color/gray"
+            android:textSize="13sp" />
+
+        <!-- 仓库可见性：默认私有（§50.4 canCreatePrivatePersonalRepository 控制；scope 不足时置灰提示） -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <TextView
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="@string/auto_create_repo_visibility_label"
+                android:textColor="@color/charcoal"
+                android:textSize="14sp" />
+
+            <com.google.android.material.materialswitch.MaterialSwitch
+                android:id="@+id/swPrivate"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:checked="true" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:orientation="horizontal">
+
+            <com.google.android.material.textfield.TextInputLayout
+                android:id="@+id/newRepoInputLayout"
+                style="@style/Widget.Material3.TextInputLayout.OutlinedBox"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:hint="@string/new_repo_name_hint"
+                app:boxStrokeWidthFocused="2dp">
+
+                <com.google.android.material.textfield.TextInputEditText
+                    android:id="@+id/etNewRepoName"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:imeOptions="actionDone"
+                    android:inputType="text"
+                    android:maxLines="1" />
+            </com.google.android.material.textfield.TextInputLayout>
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/bnAddRepo"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="8dp"
+                android:minHeight="0dp"
+                android:text="@string/auto_create_repo_add"
+                app:cornerRadius="8dp" />
+        </LinearLayout>
+
+        <!-- 已添加的自动建仓仓库名列表（动态填充） -->
+        <LinearLayout
+            android:id="@+id/newRepoList"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical" />
+    </LinearLayout>
+
+    <TextView
+        android:id="@+id/tvEmpty"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:gravity="center"
+        android:padding="32dp"
+        android:textColor="@color/gray"
+        android:textSize="15sp"
+        android:visibility="gone"
+        tools:text="暂无成员"
+        tools:visibility="visible" />
+
+    <androidx.recyclerview.widget.RecyclerView
+        android:id="@+id/rvItems"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:paddingHorizontal="12dp"
+        android:paddingVertical="8dp" />
+
+    <com.google.android.material.button.MaterialButton
+        android:id="@+id/bnDone"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_margin="16dp"
+        android:minHeight="52dp"
+        android:text="@string/confirm"
+        android:textSize="18sp"
+        android:textStyle="bold"
+        app:cornerRadius="12dp" />
+</LinearLayout>

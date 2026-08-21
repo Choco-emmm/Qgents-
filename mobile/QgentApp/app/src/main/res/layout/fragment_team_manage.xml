@@ -1,0 +1,168 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 团队管理：顶部栏（返回+标题+创建按钮）+ 两个三角下拉分组（我加入的 / 我创建的） -->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="?android:attr/colorBackground"
+    android:orientation="vertical"
+    tools:context=".ui.team.TeamManageFragment">
+
+    <!-- ===== 顶部栏 ===== -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:background="@color/navy"
+        android:paddingStart="8dp"
+        android:paddingTop="15dp"
+        android:paddingEnd="10dp"
+        android:paddingBottom="10dp">
+
+        <ImageButton
+            android:id="@+id/ivBack"
+            android:layout_width="45dp"
+            android:layout_height="45dp"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            android:contentDescription="@string/action_back"
+            android:src="@drawable/ic_back"
+            app:tint="@color/blue_tint" />
+
+        <TextView
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="@string/team_manage"
+            android:textAppearance="@style/TextAppearance.Material3.HeadlineSmall"
+            android:textColor="@color/blue_tint"
+            android:textStyle="bold" />
+
+        <ImageButton
+            android:id="@+id/btnTeamMenu"
+            android:layout_width="40dp"
+            android:layout_height="40dp"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            android:contentDescription="@string/team_manage"
+            android:src="@drawable/ic_more"
+            app:tint="@color/blue_tint" />
+    </LinearLayout>
+
+    <View
+        android:layout_width="match_parent"
+        android:layout_height="1dp"
+        android:background="@color/divider" />
+
+    <ScrollView
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:fillViewport="true"
+        android:scrollbars="none">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:paddingTop="8dp"
+            android:paddingBottom="24dp"
+            android:background="@color/light_gray">
+
+            <!-- ===== 分组一：我加入的团队 ===== -->
+            <LinearLayout
+                android:id="@+id/headerJoined"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:background="@drawable/bg_card"
+                android:backgroundTint="@color/navy_light"
+                android:gravity="center_vertical"
+                android:orientation="horizontal"
+                android:paddingStart="16dp"
+                android:paddingTop="14dp"
+                android:paddingEnd="16dp"
+                android:paddingBottom="14dp"
+                android:layout_marginHorizontal="5dp">
+
+                <ImageView
+                    android:id="@+id/ivArrowJoined"
+                    android:layout_width="20dp"
+                    android:layout_height="20dp"
+                    android:contentDescription="@string/team_joined"
+                    android:src="@drawable/ic_triangle"
+                    android:rotation="180"
+                    app:tint="@color/blue_tint" />
+
+                <TextView
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="10dp"
+                    android:layout_weight="1"
+                    android:text="@string/team_joined"
+                    android:textColor="@color/blue_tint"
+                    android:textSize="18sp"
+                    android:textStyle="bold" />
+
+            </LinearLayout>
+
+            <LinearLayout
+                android:id="@+id/rvJoined"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:paddingBottom="4dp" />
+
+            <View
+                android:layout_width="match_parent"
+                android:layout_height="1dp"
+                android:layout_marginStart="16dp"
+                android:layout_marginTop="10dp"
+                android:layout_marginEnd="16dp"
+                android:background="@color/divider" />
+
+            <!-- ===== 分组二：我创建的团队 ===== -->
+            <LinearLayout
+                android:id="@+id/headerCreated"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:background="@drawable/bg_card"
+                android:backgroundTint="@color/navy_light"
+                app:cornerRadius="20dp"
+                android:gravity="center_vertical"
+                android:orientation="horizontal"
+                android:paddingStart="16dp"
+                android:paddingTop="14dp"
+                android:paddingEnd="16dp"
+                android:paddingBottom="14dp"
+                android:layout_marginHorizontal="5dp">
+
+                <ImageView
+                    android:id="@+id/ivArrowCreated"
+                    android:layout_width="20dp"
+                    android:layout_height="20dp"
+                    android:rotation="180"
+                    android:contentDescription="@string/team_created"
+                    android:src="@drawable/ic_triangle"
+                    app:tint="@color/blue_tint"/>
+
+                <TextView
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="10dp"
+                    android:layout_weight="1"
+                    android:text="@string/team_created"
+                    android:textColor="@color/blue_tint"
+                    android:textSize="18sp"
+                    android:textStyle="bold" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:id="@+id/rvCreated"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:paddingBottom="4dp" />
+        </LinearLayout>
+    </ScrollView>
+
+</LinearLayout>

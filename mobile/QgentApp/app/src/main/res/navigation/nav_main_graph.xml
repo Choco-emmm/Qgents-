@@ -1,0 +1,359 @@
+<?xml version="1.0" encoding="utf-8"?>
+<navigation xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:id="@+id/nav_main_graph"
+    app:startDestination="@id/splashFragment">
+
+    <fragment
+        android:id="@+id/splashFragment"
+        android:name="com.example.qgent.ui.splash.SplashFragment"
+        android:label="@string/splash_loading"
+        tools:layout="@layout/fragment_splash" />
+
+    <fragment
+        android:id="@+id/chatListFragment"
+        android:name="com.example.qgent.ui.chat.ChatListFragment"
+        android:label="@string/nav_chat"
+        tools:layout="@layout/fragment_chat_list">
+        <action
+            android:id="@+id/action_chatList_to_search"
+            app:destination="@id/searchFragment" />
+        <action
+            android:id="@+id/action_chatList_to_chatDetail"
+            app:destination="@id/chatDetailFragment" />
+        <action
+            android:id="@+id/action_chatList_to_projectDetail"
+            app:destination="@id/projectDetailFragment" />
+    </fragment>
+
+    <fragment
+        android:id="@+id/searchFragment"
+        android:name="com.example.qgent.ui.search.SearchFragment"
+        android:label="@string/search_placeholder"
+        tools:layout="@layout/fragment_search">
+        <action
+            android:id="@+id/action_search_to_chatDetail"
+            app:destination="@id/chatDetailFragment" />
+    </fragment>
+
+    <fragment
+        android:id="@+id/tasksFragment"
+        android:name="com.example.qgent.ui.tasks.TasksFragment"
+        android:label="@string/nav_tasks"
+        tools:layout="@layout/fragment_tasks">
+        <action
+            android:id="@+id/action_tasks_to_taskCardList"
+            app:destination="@id/taskCardListFragment" />
+        <action
+            android:id="@+id/action_tasks_to_taskDetail"
+            app:destination="@id/taskDetailFragment" />
+    </fragment>
+
+    <!-- 交付中心（CODE 交付物 + MR，diff 审核之后的交付流程） -->
+    <fragment
+        android:id="@+id/deliveryCenterFragment"
+        android:name="com.example.qgent.ui.delivery.DeliveryCenterFragment"
+        android:label="@string/nav_delivery"
+        tools:layout="@layout/fragment_delivery_center">
+        <action
+            android:id="@+id/action_deliveryCenter_to_mrList"
+            app:destination="@id/mergeRequestListFragment" />
+        <action
+            android:id="@+id/action_deliveryCenter_to_mrDetail"
+            app:destination="@id/mergeRequestDetailFragment" />
+        <action
+            android:id="@+id/action_deliveryCenter_to_deliveryItemList"
+            app:destination="@id/deliveryItemListFragment" />
+        <action
+            android:id="@+id/action_deliveryCenter_to_deliveryItemDetail"
+            app:destination="@id/deliveryItemDetailFragment" />
+        <action
+            android:id="@+id/action_deliveryCenter_to_testsetList"
+            app:destination="@id/testsetListFragment" />
+        <action
+            android:id="@+id/action_deliveryCenter_to_deliveryMessageList"
+            app:destination="@id/deliveryMessageListFragment" />
+    </fragment>
+
+    <!-- Testset 列表页（仅管理员可见入口） -->
+    <fragment
+        android:id="@+id/testsetListFragment"
+        android:name="com.example.qgent.ui.tasks.TestsetListFragment"
+        android:label="TestSet"
+        tools:layout="@layout/fragment_testset_list" />
+
+    <fragment
+        android:id="@+id/deliveryItemListFragment"
+        android:name="com.example.qgent.ui.delivery.DeliveryItemListFragment"
+        android:label="交付物列表"
+        tools:layout="@layout/fragment_delivery_item_list">
+        <action
+            android:id="@+id/action_deliveryItemList_to_deliveryItemDetail"
+            app:destination="@id/deliveryItemDetailFragment" />
+    </fragment>
+
+    <!-- 交付物详情：交付物信息 + 逐仓库进度 + MR/任务入口（从 MR 详情交付流程抽离） -->
+    <fragment
+        android:id="@+id/deliveryItemDetailFragment"
+        android:name="com.example.qgent.ui.delivery.DeliveryItemDetailFragment"
+        android:label="交付物详情"
+        tools:layout="@layout/fragment_delivery_item_detail">
+        <action
+            android:id="@+id/action_deliveryItemDetail_to_taskDetail"
+            app:destination="@id/taskDetailFragment" />
+    </fragment>
+
+    <fragment
+        android:id="@+id/taskCardListFragment"
+        android:name="com.example.qgent.ui.tasks.TaskCardListFragment"
+        android:label="任务列表"
+        tools:layout="@layout/fragment_task_card_list">
+        <action
+            android:id="@+id/action_taskCardList_to_taskDetail"
+            app:destination="@id/taskDetailFragment" />
+    </fragment>
+
+    <fragment
+        android:id="@+id/taskDetailFragment"
+        android:name="com.example.qgent.ui.tasks.TaskDetailFragment"
+        android:label="任务详情"
+        tools:layout="@layout/fragment_task_detail" />
+
+    <fragment
+        android:id="@+id/mergeRequestListFragment"
+        android:name="com.example.qgent.ui.tasks.MergeRequestListFragment"
+        android:label="合并请求"
+        tools:layout="@layout/fragment_mr_list">
+        <action
+            android:id="@+id/action_mrList_to_mrDetail"
+            app:destination="@id/mergeRequestDetailFragment" />
+    </fragment>
+
+    <fragment
+        android:id="@+id/mergeRequestDetailFragment"
+        android:name="com.example.qgent.ui.tasks.MergeRequestDetailFragment"
+        android:label="合并请求详情"
+        tools:layout="@layout/fragment_mr_detail" />
+
+    <fragment
+        android:id="@+id/agentFragment"
+        android:name="com.example.qgent.ui.agent.AgentFragment"
+        android:label="@string/nav_agent"
+        tools:layout="@layout/fragment_agent">
+        <action
+            android:id="@+id/action_agent_to_agentDetail"
+            app:destination="@id/agentDetailFragment" />
+        <action
+            android:id="@+id/action_agent_to_agentEdit"
+            app:destination="@id/agentEditFragment" />
+        <action
+            android:id="@+id/action_agent_to_memoryPool"
+            app:destination="@id/memoryPoolFragment" />
+        <action
+            android:id="@+id/action_agent_to_skillPool"
+            app:destination="@id/skillPoolFragment" />
+    </fragment>
+
+    <fragment
+        android:id="@+id/agentEditFragment"
+        android:name="com.example.qgent.ui.agent.AgentEditFragment"
+        android:label="新建/编辑 Agent"
+        tools:layout="@layout/fragment_agent_edit">
+        <argument
+            android:name="agentId"
+            android:defaultValue="" />
+        <argument
+            android:name="agentName"
+            android:defaultValue="" />
+        <argument
+            android:name="agentRole"
+            android:defaultValue="" />
+        <argument
+            android:name="agentDescription"
+            android:defaultValue="" />
+        <argument
+            android:name="agentAvatar"
+            android:defaultValue="" />
+        <argument
+            android:name="agentPrompt"
+            android:defaultValue="" />
+    </fragment>
+
+    <fragment
+        android:id="@+id/agentDetailFragment"
+        android:name="com.example.qgent.ui.agent.AgentDetailFragment"
+        android:label="Agent 详情"
+        tools:layout="@layout/fragment_agent_detail">
+        <argument
+            android:name="agentId"
+            android:defaultValue="" />
+        <argument
+            android:name="agentName"
+            android:defaultValue="" />
+        <argument
+            android:name="agentDescription"
+            android:defaultValue="" />
+        <argument
+            android:name="agentRole"
+            android:defaultValue="" />
+        <argument
+            android:name="agentCapabilities"
+            android:defaultValue="" />
+        <action
+            android:id="@+id/action_agentDetail_to_agentEdit"
+            app:destination="@id/agentEditFragment" />
+    </fragment>
+
+    <fragment
+        android:id="@+id/chatDetailFragment"
+        android:name="com.example.qgent.ui.chat.ChatDetailFragment"
+        android:label="@string/nav_chat"
+        tools:layout="@layout/fragment_chat_detail">
+        <argument
+            android:name="groupName"
+            android:defaultValue="" />
+        <argument
+            android:name="groupId"
+            android:defaultValue="" />
+        <action
+            android:id="@+id/action_chatDetail_to_chatSettings"
+            app:destination="@id/chatSettingsFragment" />
+    </fragment>
+
+    <fragment
+        android:id="@+id/chatSettingsFragment"
+        android:name="com.example.qgent.ui.chat.ChatSettingsFragment"
+        android:label="@string/chat_settings_title"
+        tools:layout="@layout/fragment_chat_settings">
+        <argument
+            android:name="groupId"
+            android:defaultValue="" />
+        <action
+            android:id="@+id/action_chatSettings_to_memberList"
+            app:destination="@id/chatMemberListFragment" />
+    </fragment>
+
+    <fragment
+        android:id="@+id/chatMemberListFragment"
+        android:name="com.example.qgent.ui.chat.ChatMemberListFragment"
+        android:label="@string/member_list_title"
+        tools:layout="@layout/fragment_member_list">
+        <argument
+            android:name="groupId"
+            android:defaultValue="" />
+    </fragment>
+
+    <fragment
+        android:id="@+id/memoryPoolFragment"
+        android:name="com.example.qgent.ui.agent.MemoryPoolFragment"
+        android:label="Memory 池"
+        tools:layout="@layout/fragment_memory_pool" />
+
+    <fragment
+        android:id="@+id/skillPoolFragment"
+        android:name="com.example.qgent.ui.agent.SkillPoolFragment"
+        android:label="Skill 池"
+        tools:layout="@layout/fragment_skill_pool" />
+
+    <fragment
+        android:id="@+id/profileFragment"
+        android:name="com.example.qgent.ui.personal.ProfileFragment"
+        android:label="个人信息"
+        tools:layout="@layout/fragment_profile" />
+
+    <fragment
+        android:id="@+id/teamManageFragment"
+        android:name="com.example.qgent.ui.team.TeamManageFragment"
+        android:label="@string/team_manage"
+        tools:layout="@layout/fragment_team_manage" />
+
+    <fragment
+        android:id="@+id/teamDetailFragment"
+        android:name="com.example.qgent.ui.team.TeamDetailFragment"
+        android:label="团队详情"
+        tools:layout="@layout/fragment_team_detail">
+        <argument
+            android:name="teamName"
+            android:defaultValue="" />
+    </fragment>
+
+    <fragment
+        android:id="@+id/githubAuthorizeFragment"
+        android:name="com.example.qgent.ui.github.GitHubAuthorizeFragment"
+        android:label="@string/github_authorize_title"
+        tools:layout="@layout/fragment_github_authorize">
+        <argument
+            android:name="teamId"
+            android:defaultValue="" />
+        <argument
+            android:name="teamName"
+            android:defaultValue="" />
+    </fragment>
+
+    <fragment
+        android:id="@+id/githubFragment"
+        android:name="com.example.qgent.ui.github.GithubFragment"
+        android:label="@string/github_title"
+        tools:layout="@layout/fragment_github" />
+
+    <!-- 个人 GitHub OAuth 绑定页（§50）：创建项目自动建仓的前置绑定入口 -->
+    <fragment
+        android:id="@+id/personalGithubOAuthFragment"
+        android:name="com.example.qgent.ui.github.PersonalGithubOAuthFragment"
+        android:label="@string/personal_github_oauth_title"
+        tools:layout="@layout/fragment_personal_github_oauth" />
+
+    <fragment
+        android:id="@+id/messageListFragment"
+        android:name="com.example.qgent.ui.message.MessageListFragment"
+        android:label="@string/message_list"
+        tools:layout="@layout/fragment_message_list">
+        <action
+            android:id="@+id/action_messageList_to_taskDetail"
+            app:destination="@id/taskDetailFragment" />
+    </fragment>
+
+    <fragment
+        android:id="@+id/taskMessageListFragment"
+        android:name="com.example.qgent.ui.message.TaskMessageListFragment"
+        android:label="@string/message_list"
+        tools:layout="@layout/fragment_message_list">
+        <action
+            android:id="@+id/action_taskMessageList_to_taskDetail"
+            app:destination="@id/taskDetailFragment" />
+    </fragment>
+
+    <!-- 交付中心管理员消息列表：仅接收当前项目的 MR 申请审批通知（MR_PENDING） -->
+    <fragment
+        android:id="@+id/deliveryMessageListFragment"
+        android:name="com.example.qgent.ui.message.DeliveryMessageListFragment"
+        android:label="@string/message_list"
+        tools:layout="@layout/fragment_message_list" />
+
+    <fragment
+        android:id="@+id/newProjectFragment"
+        android:name="com.example.qgent.ui.personal.NewProjectFragment"
+        android:label="@string/new_project_title"
+        tools:layout="@layout/fragment_new_project">
+        <argument
+            android:name="teamId"
+            android:defaultValue="" />
+    </fragment>
+
+    <fragment
+        android:id="@+id/projectSelectionFragment"
+        android:name="com.example.qgent.ui.personal.ProjectSelectionFragment"
+        android:label="@string/confirm"
+        tools:layout="@layout/fragment_project_selection">
+        <argument
+            android:name="mode"
+            android:defaultValue="members" />
+    </fragment>
+
+    <fragment
+        android:id="@+id/projectDetailFragment"
+        android:name="com.example.qgent.ui.personal.ProjectDetailFragment"
+        android:label="@string/project_detail_title"
+        tools:layout="@layout/fragment_project_detail" />
+</navigation>

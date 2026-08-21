@@ -1,0 +1,245 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="?attr/colorSurface"
+    android:backgroundTint="@color/light_gray"
+    android:orientation="vertical"
+    tools:context=".ui.chat.ChatDetailFragment">
+
+    <!-- 顶部栏：返回 | 群名 | 设置 -->
+    <LinearLayout
+        android:background="@color/navy"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:paddingStart="4dp"
+        android:paddingTop="6dp"
+        android:paddingEnd="4dp"
+        android:paddingBottom="6dp">
+
+        <ImageButton
+            android:id="@+id/btnBack"
+            android:layout_width="44dp"
+            android:layout_height="44dp"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            android:contentDescription="@string/action_back"
+            android:src="@drawable/ic_back"
+            app:tint="@color/off_white" />
+
+        <TextView
+            android:id="@+id/tvGroupName"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:ellipsize="end"
+            android:gravity="center"
+            android:maxLines="1"
+            android:textColor="@color/off_white"
+            android:textSize="17sp"
+            android:textStyle="bold"
+
+            tools:text="登录功能" />
+
+        <ImageButton
+            android:id="@+id/btnSettings"
+            android:layout_width="44dp"
+            android:layout_height="44dp"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            android:contentDescription="@string/chat_settings_title"
+            android:src="@drawable/ic_settings"
+            android:backgroundTint="@color/off_white"
+            app:tint="@color/off_white" />
+    </LinearLayout>
+
+    <View
+        android:layout_width="match_parent"
+        android:layout_height="1dp"
+        android:background="@color/divider" />
+
+    <!-- 多选操作条：长按消息选「多选」后显示（取消 | 已选数 | 生成 Memory 草稿） -->
+    <LinearLayout
+        android:id="@+id/llMultiSelectBar"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:background="@color/navy_light"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:paddingStart="8dp"
+        android:paddingTop="6dp"
+        android:paddingEnd="8dp"
+        android:paddingBottom="6dp"
+        android:visibility="gone">
+
+        <TextView
+            android:id="@+id/btnCancelMultiSelect"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:background="?attr/selectableItemBackground"
+            android:padding="6dp"
+            android:text="@string/cancel"
+            android:textColor="@color/text_primary"
+            android:textSize="14sp" />
+
+        <TextView
+            android:id="@+id/tvMultiSelectCount"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="12dp"
+            android:layout_weight="1"
+            android:textColor="@color/text_secondary"
+            android:textSize="13sp"
+            tools:text="已选 0 条" />
+
+        <TextView
+            android:id="@+id/btnCreateMemoryDraft"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:background="?attr/selectableItemBackground"
+            android:padding="6dp"
+            android:text="@string/create_memory_draft"
+            android:textColor="@color/primary"
+            android:textSize="14sp"
+            android:textStyle="bold" />
+    </LinearLayout>
+
+    <!-- 消息列表 + 未读「有人@你」提示条（悬浮于列表底部居中） -->
+    <FrameLayout
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1">
+
+        <androidx.recyclerview.widget.RecyclerView
+            android:id="@+id/rvMessages"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:clipToPadding="false"
+            android:paddingTop="4dp"
+            android:paddingBottom="8dp" />
+
+        <!-- 上滑加载更早消息：顶部加载指示 -->
+        <ProgressBar
+            android:id="@+id/pbLoadingOlder"
+            style="?android:attr/progressBarStyleSmall"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="top|center_horizontal"
+            android:layout_marginTop="8dp"
+            android:visibility="gone" />
+
+        <!-- 未读「有人@你」提示条（对齐 web ChatPanel）：点击滚动到被 @ 的消息并高亮，点击后消失 -->
+        <TextView
+            android:id="@+id/btnMentionBar"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="bottom|center_horizontal"
+            android:layout_marginBottom="10dp"
+            android:background="@drawable/bg_mention_bar"
+            android:clickable="true"
+            android:focusable="true"
+            android:paddingStart="16dp"
+            android:paddingTop="7dp"
+            android:paddingEnd="16dp"
+            android:paddingBottom="7dp"
+            android:text="@string/mention_bar_text"
+            android:textColor="@color/status_yellow"
+            android:textSize="13sp"
+            android:visibility="gone"
+            tools:visibility="visible" />
+    </FrameLayout>
+
+    <View
+        android:layout_width="match_parent"
+        android:layout_height="1dp"
+        android:background="@color/divider" />
+
+    <!-- 引用提示条：引用消息时显示，可关闭 -->
+    <LinearLayout
+        android:id="@+id/llQuoteBar"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:background="@color/navy_light"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:paddingStart="16dp"
+        android:paddingTop="6dp"
+        android:paddingEnd="8dp"
+        android:paddingBottom="6dp"
+        android:visibility="gone"
+        tools:visibility="visible">
+
+        <TextView
+            android:id="@+id/tvQuoteBar"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:ellipsize="end"
+            android:maxLines="1"
+            android:textColor="@color/text_secondary"
+            android:textSize="13sp"
+            tools:text="回复 张三：今天把登录接口联调一下" />
+
+        <ImageButton
+            android:id="@+id/btnCancelQuote"
+            android:layout_width="30dp"
+            android:layout_height="30dp"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            android:contentDescription="@string/cancel_quote"
+            android:src="@drawable/ic_close"
+            app:tint="@color/text_secondary" />
+    </LinearLayout>
+
+    <!-- 输入栏 -->
+    <LinearLayout
+        android:id="@+id/inputBar"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:paddingTop="10dp"
+        android:paddingHorizontal="10dp"
+        android:paddingBottom="8dp"
+        android:background="@color/navy_light">
+
+        <EditText
+            android:id="@+id/etInput"
+            android:layout_width="250dp"
+            android:layout_height="35dp"
+            android:background="@drawable/bg_search_box"
+            android:hint="@string/chat_input_hint"
+            android:imeOptions="actionSend"
+            android:inputType="text"
+            android:maxLines="4"
+            android:layout_marginVertical="8dp"
+            android:layout_marginStart="10dp"
+            android:paddingStart="14dp"
+            android:paddingEnd="8dp"
+            android:textColor="?android:attr/textColorPrimary"
+            android:textSize="15sp" />
+
+        <ImageButton
+            android:id="@+id/btnPlus"
+            android:layout_width="20dp"
+            android:layout_height="20dp"
+            android:layout_marginHorizontal="5dp"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            android:backgroundTint="@color/off_white"
+            app:tint="@color/off_white"
+            android:contentDescription="@string/nav_chat"
+            android:src="@drawable/ic_add" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/btnSend"
+            android:layout_width="wrap_content"
+            android:layout_height="40dp"
+            android:layout_marginStart="4dp"
+            android:minWidth="0dp"
+            android:paddingStart="15dp"
+            android:paddingEnd="15dp"
+            android:text="@string/send" />
+    </LinearLayout>
+
+</LinearLayout>

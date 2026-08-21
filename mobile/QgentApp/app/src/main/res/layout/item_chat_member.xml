@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:gravity="center_vertical"
+    android:orientation="horizontal"
+    android:background="@drawable/bg_card"
+    android:backgroundTint="@color/white"
+    android:paddingTop="5dp"
+    android:paddingBottom="5dp"
+    android:layout_marginTop="5dp">
+
+    <ImageView
+        android:id="@+id/ivMemberAvatar"
+        android:layout_width="36dp"
+        android:layout_height="36dp"
+        android:contentDescription="@string/avatar"
+        android:src="@drawable/ic_avatar_default" />
+
+    <TextView
+        android:id="@+id/tvMemberName"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="12dp"
+        android:layout_weight="1"
+        android:textColor="@color/text_primary"
+        android:textSize="15sp"
+        tools:text="张三" />
+
+    <TextView
+        android:id="@+id/tvAgentTag"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:background="@drawable/bg_status_tag"
+        android:gravity="center"
+        android:paddingStart="6dp"
+        android:paddingTop="2dp"
+        android:paddingEnd="6dp"
+        android:paddingBottom="2dp"
+        android:text="Agent"
+        android:textColor="@color/white"
+        android:textSize="11sp"
+        android:visibility="gone"
+        tools:visibility="visible" />
+
+    <!-- 移除成员：仅我创建的团队详情页显示，Owner 行不可移除 -->
+    <ImageView
+        android:id="@+id/ivDeleteMember"
+        android:layout_width="32dp"
+        android:layout_height="32dp"
+        android:layout_marginStart="4dp"
+        android:background="?attr/selectableItemBackgroundBorderless"
+        android:contentDescription="@string/remove_member"
+        android:padding="6dp"
+        android:src="@drawable/ic_close"
+        app:tint="@color/gray"
+        android:visibility="gone"
+        tools:visibility="visible" />
+
+    <!-- 角色标签：项目详情页管理员管理用（管理员/成员），点击切换身份 -->
+    <TextView
+        android:id="@+id/tvMemberRole"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="6dp"
+        android:paddingStart="6dp"
+        android:paddingTop="2dp"
+        android:paddingEnd="6dp"
+        android:paddingBottom="2dp"
+        android:textColor="@color/teal"
+        android:textSize="12sp"
+        android:visibility="gone"
+        tools:text="管理员" />
+
+    <!-- 群聊内无角色区分，均为平等 member -->
+</LinearLayout>

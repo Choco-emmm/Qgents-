@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/previewRoot"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#CC000000"
+    android:clickable="true">
+
+    <com.example.qgent.ui.chat.ZoomableImageView
+        android:id="@+id/ivPreview"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:adjustViewBounds="true"
+        android:contentDescription="@string/image" />
+
+    <!-- 图片加载中：居中加载态，加载完成/失败后隐藏 -->
+    <ProgressBar
+        android:id="@+id/pbPreviewLoading"
+        style="?android:attr/progressBarStyleLarge"
+        android:layout_width="48dp"
+        android:layout_height="48dp"
+        android:layout_gravity="center"
+        android:visibility="gone" />
+</FrameLayout>

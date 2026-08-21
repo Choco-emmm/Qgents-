@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 应用图标前景：整图作为前景层，自适应图标系统会将其缩放到安全区（约 61%）
+     居中显示；图片自带米白底色与 ic_launcher_background 一致，视觉上融合为
+     米白底 + 深色 Logo 图形。 -->
+<bitmap xmlns:android="http://schemas.android.com/apk/res/android"
+    android:src="@drawable/ic_launcher_foreground_img"
+    android:gravity="center" />

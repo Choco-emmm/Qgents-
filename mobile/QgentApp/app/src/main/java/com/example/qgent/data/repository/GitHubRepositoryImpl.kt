@@ -1,0 +1,71 @@
+package com.example.qgent.data.repository
+
+import com.example.qgent.data.api.QgApiService
+import com.example.qgent.data.model.BindProjectRepositoryRequest
+import com.example.qgent.data.model.CreateProjectRepositoryRequest
+import com.example.qgent.data.model.EmptyBody
+import com.example.qgent.data.model.GitHubInstallationDto
+import com.example.qgent.data.model.GitHubInstallationUrlDto
+import com.example.qgent.data.model.GitHubOAuthStartResponse
+import com.example.qgent.data.model.GitHubRepositoryDto
+import com.example.qgent.data.model.PersonalGithubOAuthDto
+import com.example.qgent.data.model.ProjectRepositoryDto
+import com.example.qgent.data.model.toDataOrThrow
+import com.example.qgent.data.model.toUnitOrThrow
+
+class GitHubRepositoryImpl(private val service: QgApiService) : GitHubRepository {
+
+    override suspend fun createInstallation(teamId: String, idempotencyKey: String): Result<GitHubInstallationUrlDto> =
+        apiCall { service.createInstallation(teamId, idempotencyKey, client = "MOBILE").toDataOrThrow() }
+
+    override suspend fun getInstallations(teamId: String): Result<List<GitHubInstallationDto>> =
+        apiCall { service.getInstallations(teamId).toDataOrThrow() }
+
+    override suspend fun deleteInstallation(teamId: String, installationId: String, idempotencyKey: String): Result<Unit> =
+        apiCall { service.deleteInstallation(teamId, installationId, idempotencyKey).toUnitOrThrow() }
+
+    override suspend fun syncInstallation(teamId: String, installationId: String, idempotencyKey: String): Result<GitHubInstallationDto> =
+        apiCall { service.syncInstallation(teamId, installationId, idempotencyKey).toDataOrThrow() }
+
+    override suspend fun revokeGithubRepository(teamId: String, repositoryId: String, idempotencyKey: String): Result<Unit> =
+        apiCall { service.revokeGithubRepository(teamId, repositoryId, idempotencyKey).toUnitOrThrow() }
+
+    override suspend fun getGithubRepositories(teamId: String): Result<List<GitHubRepositoryDto>> =
+        apiCall {
+            // 接口按 cursor/limit 分页（文档 §2，默认 30），循环拉全量避免仓库数量被截断
+            val all = mutableListOf<GitHubRepositoryDto>()
+            var cursor: String? = null
+            do {
+                val resp = service.getGithubRepositories(teamId, cursor)
+                all += resp.toDataOrThrow()
+                val page = resp.body()?.page
+                cursor = page?.nextCursor?.takeIf { page.hasMore }
+            } while (cursor != null)
+            all
+        }
+
+    override suspend fun getProjectRepositories(projectId: String): Result<List<ProjectRepositoryDto>> =
+        apiCall { service.getProjectRepositories(projectId).toDataOrThrow() }
+
+    override suspend fun bindProjectRepository(projectId: String, idempotencyKey: String, body: BindProjectRepositoryRequest): Result<ProjectRepositoryDto> =
+        apiCall { service.bindProjectRepository(projectId, idempotencyKey, body).toDataOrThrow() }
+
+    override suspend fun createAndBindProjectRepository(
+        projectId: String,
+        idempotencyKey: String,
+        body: CreateProjectRepositoryRequest
+    ): Result<ProjectRepositoryDto> =
+        apiCall { service.createAndBindProjectRepository(projectId, idempotencyKey, body).toDataOrThrow() }
+
+    override suspend fun unbindProjectRepository(projectId: String, projectRepositoryId: String, idempotencyKey: String): Result<Unit> =
+        apiCall { service.unbindProjectRepository(projectId, projectRepositoryId, idempotencyKey).toUnitOrThrow() }
+
+    override suspend fun startPersonalOAuth(idempotencyKey: String): Result<GitHubOAuthStartResponse> =
+        apiCall { service.startPersonalGithubOAuth("MOBILE", idempotencyKey, EmptyBody()).toDataOrThrow() }
+
+    override suspend fun getPersonalOAuthStatus(): Result<PersonalGithubOAuthDto> =
+        apiCall { service.getPersonalGithubOAuth().toDataOrThrow() }
+
+    override suspend fun revokePersonalOAuth(idempotencyKey: String): Result<Unit> =
+        apiCall { service.revokePersonalGithubOAuth(idempotencyKey).toUnitOrThrow() }
+}

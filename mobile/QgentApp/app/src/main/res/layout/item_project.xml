@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:gravity="center_vertical"
+    android:orientation="horizontal"
+    android:layout_marginTop="5dp"
+    android:paddingStart="16dp"
+    android:paddingTop="14dp"
+    android:background="@drawable/bg_card"
+    android:paddingEnd="16dp"
+    android:paddingBottom="14dp">
+
+    <ImageView
+        android:id="@+id/ivProjectAvatar"
+        android:layout_width="36dp"
+        android:layout_height="36dp"
+        android:background="@drawable/bg_avatar"
+        android:contentDescription="@string/project_avatar"
+        android:src="@drawable/ic_folder"
+        app:tint="@color/text_secondary" />
+
+    <TextView
+        android:id="@+id/tvProjectName"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="10dp"
+        android:layout_weight="1"
+        android:ellipsize="end"
+        android:maxLines="1"
+        android:textColor="?android:attr/textColorPrimary"
+        android:textSize="16sp"
+        tools:text="项目名称" />
+
+    <!-- 项目未读红点：固定在行末，名字过长时文字省略为它让位 -->
+    <View
+        android:id="@+id/ivUnread"
+        android:layout_width="10dp"
+        android:layout_height="10dp"
+        android:layout_gravity="center_vertical"
+        android:layout_marginStart="6dp"
+        android:background="@drawable/bg_unread_badge"
+        android:visibility="gone"
+        tools:visibility="visible" />
+</LinearLayout>

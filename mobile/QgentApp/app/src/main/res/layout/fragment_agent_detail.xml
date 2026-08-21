@@ -1,0 +1,182 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    tools:context=".ui.agent.AgentDetailFragment">
+
+    <!-- 顶部栏：返回 + 标题 -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:background="@color/navy"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:paddingStart="4dp"
+        android:paddingTop="6dp"
+        android:paddingEnd="8dp"
+        android:paddingBottom="6dp">
+
+        <ImageButton
+            android:id="@+id/btnBack"
+            android:layout_width="44dp"
+            android:layout_height="44dp"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            android:contentDescription="@string/action_back"
+            android:src="@drawable/ic_back"
+            app:tint="@color/white" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="4dp"
+            android:text="@string/agent_detail_title"
+            android:textColor="@color/white"
+            android:textSize="18sp"
+            android:textStyle="bold" />
+    </LinearLayout>
+
+    <ScrollView
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:background="?attr/colorSurfaceVariant">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:padding="16dp">
+
+        <!-- Agent 基本信息 -->
+        <com.google.android.material.card.MaterialCardView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="16dp"
+            app:cardBackgroundColor="?attr/colorSurface"
+            app:cardCornerRadius="12dp"
+            app:cardElevation="1dp">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:gravity="center_horizontal"
+                android:orientation="vertical"
+                android:padding="24dp">
+
+                <ImageView
+                    android:id="@+id/ivDetailAvatar"
+                    android:layout_width="72dp"
+                    android:layout_height="72dp"
+                    android:background="@drawable/bg_avatar"
+                    android:contentDescription="@string/avatar"
+                    android:src="@drawable/ic_person" />
+
+                <TextView
+                    android:id="@+id/tvDetailAgentName"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="12dp"
+                    android:textColor="?android:attr/textColorPrimary"
+                    android:textSize="20sp"
+                    android:textStyle="bold"
+                    tools:text="前端开发" />
+
+                <TextView
+                    android:id="@+id/tvDetailRole"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:background="@drawable/bg_status_tag"
+                    android:gravity="center"
+                    android:paddingStart="8dp"
+                    android:paddingTop="3dp"
+                    android:paddingEnd="8dp"
+                    android:paddingBottom="3dp"
+                    android:textColor="@color/white"
+                    android:textSize="12sp"
+                    android:visibility="gone"
+                    tools:text="调度者"
+                    tools:visibility="visible" />
+
+                <TextView
+                    android:id="@+id/tvDetailAgentDesc"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:gravity="center"
+                    android:textColor="@color/text_secondary"
+                    android:textSize="14sp"
+                    tools:text="统筹调度 Agent 团队" />
+
+                <!-- 能力标签组（chips），横向自动换行由父容器宽度撑开 -->
+                <LinearLayout
+                    android:id="@+id/containerDetailCapabilities"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:gravity="center_horizontal"
+                    android:orientation="horizontal"
+                    android:visibility="gone"
+                    tools:visibility="visible" />
+            </LinearLayout>
+        </com.google.android.material.card.MaterialCardView>
+
+        <!-- 管理操作行：编辑/发布(审批占位)/收回发布/下线（创建者或 Team Owner 可见） -->
+        <LinearLayout
+            android:id="@+id/llAgentActions"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="16dp"
+            android:background="?attr/colorSurface"
+            android:gravity="center"
+            android:orientation="horizontal"
+            android:paddingTop="8dp"
+            android:paddingBottom="8dp"
+            android:visibility="gone">
+
+            <TextView
+                android:id="@+id/tvDetailEdit"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:background="?attr/selectableItemBackground"
+                android:paddingStart="10dp"
+                android:paddingTop="6dp"
+                android:paddingEnd="10dp"
+                android:paddingBottom="6dp"
+                android:text="编辑"
+                android:textColor="@color/primary"
+                android:textSize="14sp" />
+
+            <TextView
+                android:id="@+id/tvDetailPublish"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:background="?attr/selectableItemBackground"
+                android:paddingStart="10dp"
+                android:paddingTop="6dp"
+                android:paddingEnd="10dp"
+                android:paddingBottom="6dp"
+                android:text="发布"
+                android:textColor="@color/teal"
+                android:textSize="14sp" />
+
+            <TextView
+                android:id="@+id/tvDetailArchive"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:background="?attr/selectableItemBackground"
+                android:paddingStart="10dp"
+                android:paddingTop="6dp"
+                android:paddingEnd="10dp"
+                android:paddingBottom="6dp"
+                android:text="下线"
+                android:textColor="@color/red_danger"
+                android:textSize="14sp" />
+        </LinearLayout>
+
+    </LinearLayout>
+</ScrollView>
+</LinearLayout>
