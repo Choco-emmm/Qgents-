@@ -141,7 +141,7 @@ services:
     image: cloudflare/cloudflared:latest
     restart: unless-stopped
     profiles: [tunnel]
-    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN:-disabled}
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN:?Set CLOUDFLARE_TUNNEL_TOKEN}
     networks: [backend]
 
 volumes:
