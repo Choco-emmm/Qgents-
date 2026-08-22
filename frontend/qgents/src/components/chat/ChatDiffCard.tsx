@@ -3,9 +3,10 @@ import { Link, useNavigate } from 'react-router-dom'
 import { App, Button, Empty, Input, Popconfirm, Spin, Typography } from 'antd'
 import { BranchesOutlined, DownOutlined, SearchOutlined, UpOutlined } from '@ant-design/icons'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { ApiError, diffsApi } from '@/api'
+import { ApiError, diffsApi, tasksApi } from '@/api'
 import { formatApiError } from '@/utils/formatApiError'
 import { taskModelQueryKeys } from '@/query/taskModelKeys'
+import { deliveryCenterKeys } from '@/query/deliveryCenterKeys'
 import { diffFileStatusLabel } from '@/types/diff'
 import { PATHS } from '@/routes/paths'
 import { highlightDiffCode, syntaxLanguageLabel } from '@/utils/diffSyntaxHighlight'
@@ -42,23 +43,46 @@ export function ChatDiffCard({ message, projectId, onReply }: Props) {
   const queryClient = useQueryClient()
   const c = message.content as DiffMessageContent
   const diffId = c.diffId ?? ''
+  const taskId = c.taskId?.trim() ?? ''
   const navigate = useNavigate()
   const [open, setOpen] = useState(false)
   const [keyword, setKeyword] = useState('')
   const [selectedFileId, setSelectedFileId] = useState<string | null>(null)
 
-  // 确认交付：POST /diffs/{diffId}/accept（与 Diff 评审页同一接口）
-  const acceptMutation = useMutation({
-    mutationFn: () => diffsApi.accept(projectId, diffId),
+  // 群聊卡片的确认操作必须走任务级最终 DiffReviewBatch，不能验收单个已归档的 Diff。
+  // 仅在展开时读取任务状态与 capabilities，避免历史消息列表为每张卡片额外发请求。
+  const taskQuery = useQuery({
+    queryKey: taskModelQueryKeys.tasks.detail(projectId, taskId),
+    queryFn: () => tasksApi.get(projectId, taskId),
+    enabled: open && Boolean(projectId && taskId),
+  })
+  const canConfirmDelivery = taskQuery.data?.diffReviewSummary.reviewStatus === 'PENDING_CONFIRMATION'
+    && taskQuery.data.capabilities.canConfirmDiffReview === true
+  const deliveryActionLabel = taskQuery.isLoading
+    ? '读取交付状态'
+    : canConfirmDelivery
+      ? '确认交付'
+      : taskQuery.data?.diffReviewSummary.deliveryStatus === 'DELIVERING'
+        ? '交付中'
+        : taskQuery.data?.diffReviewSummary.deliveryStatus === 'DELIVERED'
+          ? '已交付'
+          : '确认交付'
+
+  const confirmDeliveryMutation = useMutation({
+    mutationFn: () => tasksApi.confirmDiffReview(projectId, taskId),
     onSuccess: () => {
-      messageApi.success('已确认交付')
-      void queryClient.invalidateQueries({ queryKey: taskModelQueryKeys.diffs.detail(projectId, diffId) })
-      void queryClient.invalidateQueries({ queryKey: taskModelQueryKeys.diffs.files(projectId, diffId) })
-      void queryClient.invalidateQueries({ queryKey: taskModelQueryKeys.diffs.preview(projectId, diffId) })
-      // 群消息 TASK_STATUS / DIFF 卡可能随交付状态更新
+      messageApi.success('已确认交付，正在执行仓库交付')
+      void queryClient.invalidateQueries({ queryKey: taskModelQueryKeys.tasks.detail(projectId, taskId) })
+      void queryClient.invalidateQueries({ queryKey: taskModelQueryKeys.taskDiffReview.detail(projectId, taskId) })
+      void queryClient.invalidateQueries({ queryKey: taskModelQueryKeys.tasks.all(projectId) })
+      void queryClient.invalidateQueries({ queryKey: taskModelQueryKeys.diffs.all(projectId) })
+      void queryClient.invalidateQueries({ queryKey: deliveryCenterKeys.all(projectId) })
       void queryClient.invalidateQueries({ queryKey: ['groups', projectId] })
     },
-    onError: (error) => messageApi.error(formatApiError(error)),
+    onError: (error) => {
+      void taskQuery.refetch()
+      messageApi.error(formatApiError(error))
+    },
   })
 
   // §16.2 卡片折叠时不请求预览；展开 / 切换文件时才调用本接口
@@ -145,6 +169,23 @@ export function ChatDiffCard({ message, projectId, onReply }: Props) {
           <Text type="secondary" style={{ fontSize: 12 }}>{preview.totalFileCount} 个文件</Text>
         ) : null}
       </div>
+      {c.reviewStatus === 'REJECTED' && c.reviewReason?.trim() ? (
+        <div
+          style={{
+            color: '#b42318',
+            background: '#fff1f0',
+            border: '1px solid #ffccc7',
+            borderRadius: 6,
+            padding: '6px 8px',
+            fontSize: 12,
+            lineHeight: 1.55,
+            whiteSpace: 'pre-wrap',
+            overflowWrap: 'anywhere',
+          }}
+        >
+          <strong>拒绝意见：</strong>{c.reviewReason.trim()}
+        </div>
+      ) : null}
       {/* 变更文件列表（收起时展示消息 content 里的路径摘要） */}
       {!open && c.files && c.files.length > 0 ? (
         <div style={{ fontSize: 12, color: '#64748b', lineHeight: 1.6 }}>
@@ -158,7 +199,7 @@ export function ChatDiffCard({ message, projectId, onReply }: Props) {
           ) : null}
         </div>
       ) : null}
-      {/* 操作：展开 / 查看 Diff / 引用继续修改 */}
+      {/* 操作：展开 / 查看 Diff / 根据审查意见继续修改 */}
       <div style={{ display: 'flex', gap: 4, marginTop: 2, flexWrap: 'wrap' }}>
         <Button
           size="small"
@@ -175,7 +216,7 @@ export function ChatDiffCard({ message, projectId, onReply }: Props) {
         </Link>
         {onReply ? (
           <Button size="small" type="link" onClick={() => onReply(message)}>
-            引用继续修改
+            {c.reviewStatus === 'REJECTED' ? '根据拒绝意见继续修改' : '引用继续修改'}
           </Button>
         ) : null}
       </div>
@@ -373,18 +414,29 @@ export function ChatDiffCard({ message, projectId, onReply }: Props) {
                         <Button size="small" type="link">查看详情</Button>
                       </Link>
                     ) : null}
-                    {/* 右上角：确认交付 —— 看完 Diff 直接交付（POST /diffs/{diffId}/accept） */}
-                    <Popconfirm
-                      title="确认交付"
-                      description="确认该 Diff 已审查通过并交付？"
-                      okText="确认交付"
-                      cancelText="取消"
-                      onConfirm={() => acceptMutation.mutate()}
-                    >
-                      <Button size="small" type="primary" loading={acceptMutation.isPending}>
-                        确认交付
+                    {canConfirmDelivery ? (
+                      <Popconfirm
+                        title="确认交付"
+                        description="确认该任务的最终 Diff 已审查通过并开始交付？"
+                        okText="确认交付"
+                        cancelText="取消"
+                        onConfirm={() => confirmDeliveryMutation.mutate()}
+                      >
+                        <Button size="small" type="primary" loading={confirmDeliveryMutation.isPending}>
+                          确认交付
+                        </Button>
+                      </Popconfirm>
+                    ) : (
+                      <Button
+                        size="small"
+                        type="primary"
+                        loading={taskQuery.isLoading}
+                        disabled
+                        title={taskQuery.data?.capabilities.canConfirmDiffReviewDisabledReason ?? '当前交付状态不能再次确认'}
+                      >
+                        {deliveryActionLabel}
                       </Button>
-                    </Popconfirm>
+                    )}
                   </span>
                 </div>
                 {selectedFile.binary ? (

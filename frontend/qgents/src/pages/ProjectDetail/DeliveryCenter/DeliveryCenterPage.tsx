@@ -5,6 +5,7 @@ import { Alert, App, Button, Card, Empty, Form, Input, Result, Select, Skeleton,
 import {
   CheckCircleOutlined,
   CheckOutlined,
+  ClockCircleOutlined,
   CodeOutlined,
   CloudUploadOutlined,
   CloseOutlined,
@@ -17,7 +18,6 @@ import {
   RobotOutlined,
   SafetyCertificateOutlined,
   SendOutlined,
-  SettingOutlined,
   TagsOutlined,
   UserOutlined,
   WarningOutlined,
@@ -36,6 +36,7 @@ import type {
   MemoryDeliveryItem,
   SkillDeliveryItem,
 } from '@/types/delivery-center'
+import type { DiffReviewBatch } from '@/types/task-model'
 import styles from './DeliveryCenterPage.module.scss'
 
 const { Text, Title } = Typography
@@ -74,9 +75,23 @@ const ACTION_SUCCESS_TEXT: Record<DeliveryAction, string> = {
   approve: '已批准并共享',
   reject: '已拒绝该交付',
   archive: '已归档',
-  confirm: '已确认交付，正在执行仓库交付',
-  retryDelivery: '已重新发起交付',
+  confirm: '已确认交付，正在同步目标分支并执行仓库交付',
+  retryDelivery: '已重新发起交付，正在同步目标分支并重试',
 }
+
+// 确认/重试交付会先读取 GitHub 目标分支并同步到 Worker；这些错误需要给出明确的恢复动作。
+const TARGET_BRANCH_SYNC_ERROR_CODES = new Set([
+  'GITHUB_REPOSITORY_UNAVAILABLE',
+  'GITHUB_INSTALLATION_UNAVAILABLE',
+  'GITHUB_BRANCH_SHA_INVALID',
+  'GIT_BASE_REF_NOT_SYNCED',
+  'GIT_REMOTE_NETWORK_FAILED',
+  'GIT_REMOTE_RATE_LIMITED',
+  'GIT_REMOTE_SHA_MISMATCH',
+  'SANDBOX_WORKER_UNAVAILABLE',
+  'SANDBOX_WORKER_ERROR',
+  'GIT_COMMAND_TIMEOUT',
+])
 
 function formatDate(value: string | null): string {
   if (!value) return '暂无'
@@ -98,9 +113,13 @@ function readStatus(value: string | null): DeliveryDisplayStatus | undefined {
 
 function errorText(error: unknown): string {
   if (!(error instanceof ApiError)) return '操作失败，请稍后重试'
+  const code = apiErrorCode(error)
+  if (code && TARGET_BRANCH_SYNC_ERROR_CODES.has(code)) {
+    return '无法同步目标分支，请检查 GitHub 连接后重试'
+  }
   if (error.status === 403) return '无权限执行此操作'
   if (error.status === 404) return '关联资源不存在或不可见'
-  if (error.status === 409) return apiErrorCode(error) === 'DIFF_REVIEW_SUPERSEDED' ? '该 Diff 已被后续修改取代，已刷新最新数据' : '资源状态已变化，已刷新最新数据'
+  if (error.status === 409) return code === 'DIFF_REVIEW_SUPERSEDED' ? '该 Diff 已被后续修改取代，已刷新最新数据' : '资源状态已变化，已刷新最新数据'
   if (error.status === 422) return '参数无效或当前状态不可操作'
   return error.message || '操作失败，请稍后重试'
 }
@@ -122,6 +141,7 @@ export default function DeliveryCenterPage() {
   const [actionErrors, setActionErrors] = useState<Record<string, string>>({})
   const [activeItemId, setActiveItemId] = useState<string | null>(null)
   const [detailTarget, setDetailTarget] = useState<DeliveryItem | null>(null)
+  const [localCodeBatches, setLocalCodeBatches] = useState<Record<string, DiffReviewBatch>>({})
   // 搜索关键词草稿：仅在用户主动提交（Enter / blur / 清除）时同步到 URL，
   // 并辅以 300ms 防抖兜底，避免每次按键就触发 URL 变化和重新查询造成页面抖动。
   const keyword = searchParams.get('keyword') ?? ''
@@ -179,6 +199,8 @@ export default function DeliveryCenterPage() {
   const onlyActionableItems = !showAllItems && !hasExplicitFilter
 
   const itemQuery = useInfiniteDeliveryItems(projectId, { ...filters, limit: PAGE_SIZE })
+  // 侧栏活动不跟随筛选条件：始终展示该项目最近发生的交付状态变化。
+  const recentActivityQuery = useInfiniteDeliveryItems(projectId, { limit: 3 })
   const summaryQuery = useDeliverySummary(projectId, {
     groupId: filters.groupId,
     type: filters.type,
@@ -215,10 +237,17 @@ export default function DeliveryCenterPage() {
     return [...seen.values()]
   }, [itemQuery.data])
 
-  const visibleItems = useMemo(() => onlyActionableItems
-    ? items.filter((item) => hasActionableCapability(item))
-    : items,
-  [items, onlyActionableItems])
+  const visibleItems = useMemo(() => {
+    const synchronized = items.map((item) => {
+      if (item.resourceType !== 'CODE') return item
+      const batch = localCodeBatches[item.openTarget.taskId]
+      return batch ? synchronizeRejectedCodeItem(item, batch) : item
+    })
+    return onlyActionableItems
+      ? synchronized.filter((item) => hasActionableCapability(item)
+        || (item.resourceType === 'CODE' && localCodeBatches[item.openTarget.taskId]?.reviewStatus === 'REJECTED'))
+      : synchronized
+  }, [items, localCodeBatches, onlyActionableItems])
 
   const groupedItems = useMemo(() => {
     const grouped = new Map<string, { id: string | null; name: string; items: DeliveryItem[]; latestAt: string }>()
@@ -257,6 +286,13 @@ export default function DeliveryCenterPage() {
     setSearchParams(next, { replace: true })
   }
 
+  function showPendingDeliveries() {
+    const next = new URLSearchParams(searchParams)
+    next.set('status', 'PENDING_REVIEW')
+    next.delete('view')
+    setSearchParams(next, { replace: true })
+  }
+
   async function performAction(item: DeliveryItem, action: DeliveryAction, reason?: string) {
     if (actionMutation.isPending) return
     if (action === 'reject' && !reason?.trim()) {
@@ -267,7 +303,11 @@ export default function DeliveryCenterPage() {
     setActiveAction(action)
     setActionErrors((current) => ({ ...current, [item.id]: '' }))
     try {
-      await actionMutation.mutateAsync({ projectId, teamId, item, action, reason: reason?.trim() })
+      const response = await actionMutation.mutateAsync({ projectId, teamId, item, action, reason: reason?.trim() })
+      if (action === 'reject' && item.resourceType === 'CODE' && isDiffReviewBatch(response)) {
+        const rejectedBatch = response as DiffReviewBatch
+        setLocalCodeBatches((current) => ({ ...current, [item.openTarget.taskId]: rejectedBatch }))
+      }
       setActiveItemId(null)
       setActiveAction(null)
       // 后端可能先受理、再异步更新资源摘要；限时轮询避免 SSE 延迟时页面停在旧状态。
@@ -282,6 +322,12 @@ export default function DeliveryCenterPage() {
       setActionErrors((current) => ({ ...current, [item.id]: errorText(error) }))
       setActiveItemId(null)
       setActiveAction(null)
+      // 后端可能已持久化失败状态；失败后立即拉取，避免旧的 PROCESSING 状态留在页面上。
+      void Promise.all([
+        itemQuery.refetch(),
+        summaryQuery.refetch(),
+        recentActivityQuery.refetch(),
+      ])
     }
   }
 
@@ -410,7 +456,7 @@ export default function DeliveryCenterPage() {
                         <span className={styles.groupHeaderMain}><DownOutlined className={collapsed ? styles.chevronCollapsed : styles.chevron} /> <strong>{group.name}</strong><Text type="secondary">最近更新 {formatDate(group.latestAt)}</Text></span>
                         <span className={styles.groupCount}>{group.items.length} 个交付物</span>
                       </button>
-                      {!collapsed && <div className={styles.itemList}>{group.items.map((item) => <DeliveryItemCard key={item.id} item={item} active={activeItemId === item.id} activeAction={activeItemId === item.id ? activeAction : null} error={actionErrors[item.id]} onAction={performAction} onReject={openReject} onOpenResource={openResource} />)}</div>}
+                      {!collapsed && <div className={styles.itemList}>{group.items.map((item) => <DeliveryItemCard key={item.id} item={item} active={activeItemId === item.id} activeAction={activeItemId === item.id ? activeAction : null} error={actionErrors[item.id]} onAction={performAction} onReject={openReject} onOpenResource={openResource} onOpenGroup={(id) => navigate(PATHS.projectReqChat(projectId, id))} />)}</div>}
                     </section>
                   )
                 })}
@@ -420,7 +466,7 @@ export default function DeliveryCenterPage() {
           </main>
         </section>
 
-        <DeliveryOverview summaryQuery={summaryQuery} total={total} groupId={filters.groupId} />
+        <DeliveryOverview summaryQuery={summaryQuery} total={total} recentActivityQuery={recentActivityQuery} onShowPending={showPendingDeliveries} onOpenResource={openResource} />
       </div>
 
       <Modal
@@ -552,6 +598,7 @@ function DeliveryItemCard({
   onAction,
   onReject,
   onOpenResource,
+  onOpenGroup,
 }: {
   item: DeliveryItem
   active: boolean
@@ -560,6 +607,7 @@ function DeliveryItemCard({
   onAction: (item: DeliveryItem, action: DeliveryAction, reason?: string) => Promise<void>
   onReject: (item: DeliveryItem) => void
   onOpenResource: (item: DeliveryItem) => void
+  onOpenGroup: (groupId: string) => void
 }) {
   return (
     <article id={`delivery-item-${item.id}`} className={styles.itemCard}>
@@ -580,7 +628,7 @@ function DeliveryItemCard({
         <div className={styles.itemFooter}><span><UserOutlined /> {item.creator?.displayName ?? '未知'}</span><span>创建于 {formatDate(item.createdAt)}</span>{item.submittedAt ? <span>提交于 {formatDate(item.submittedAt)}</span> : null}{item.reviewer ? <span>审核者 {item.reviewer.displayName}</span> : null}</div>
         {item.reviewReason ? <div className={styles.reviewReason}><WarningOutlined /> {item.reviewReason}</div> : null}
         <div className={styles.itemActions}>
-          {item.resourceType === 'CODE' ? <CodeActions item={item} active={active} onAction={onAction} onReject={onReject} onOpenResource={onOpenResource} /> : <ResourceActions item={item} active={active} onAction={onAction} onReject={onReject} onOpenResource={onOpenResource} />}
+          {item.resourceType === 'CODE' ? <CodeActions item={item} active={active} onAction={onAction} onReject={onReject} onOpenResource={onOpenResource} onOpenGroup={onOpenGroup} /> : <ResourceActions item={item} active={active} onAction={onAction} onReject={onReject} onOpenResource={onOpenResource} />}
           {activeAction ? <Text type="secondary">{deliveryActionPendingText(activeAction)}</Text> : null}
         </div>
         {error ? <Alert className={styles.itemError} type="error" showIcon message={error} /> : null}
@@ -590,19 +638,20 @@ function DeliveryItemCard({
 }
 
 function CodeDetails({ item }: { item: CodeDeliveryItem }) {
-  return <><div className={styles.detailLine}><span><CloudUploadOutlined /> {item.repositories.map((repository) => `${repository.name} / ${display(repository.branch)}`).join('、') || '暂无仓库'}</span><span>来源 {display(item.requirementGroup?.name)}</span></div><div className={styles.detailLine}><span>Diff {item.filesChanged} 文件 · <b className={styles.additions}>+{item.additions}</b> <b className={styles.deletions}>-{item.deletions}</b></span><span>Review {codeReviewStatusLabel(item.reviewStatus)} · Delivery {item.deliveryStatus}</span></div>{item.reviewStatus === 'SUPERSEDED' ? <div className={styles.reviewReason}><WarningOutlined /> 已被同一工作区的后续修改取代，不可确认或拒绝。</div> : null}{item.repositoryDeliveries.length > 1 ? <div className={styles.repositoryStrip}>{item.repositoryDeliveries.map((delivery) => <span key={delivery.repositoryId}>{delivery.repositoryName}: {delivery.deliveryStatus}</span>)}</div> : null}{item.mergeRequest ? <div className={styles.mrLine}>MR #{item.mergeRequest.number} · {item.mergeRequest.title}</div> : null}</>
+  return <><div className={styles.detailLine}><span><CloudUploadOutlined /> {item.repositories.map((repository) => `${repository.name} / ${display(repository.branch)}`).join('、') || '暂无仓库'}</span><span>来源 {display(item.requirementGroup?.name)}</span></div><div className={styles.detailLine}><span>Diff {item.filesChanged} 文件 · <b className={styles.additions}>+{item.additions}</b> <b className={styles.deletions}>-{item.deletions}</b></span><span>Review {codeReviewStatusLabel(item.reviewStatus)} · Delivery {item.deliveryStatus}</span></div>{item.reviewStatus === 'REJECTED' ? <div className={styles.reviewReason}><WarningOutlined /> 已拒绝，请回需求群根据拒绝意见继续修改。</div> : item.reviewStatus === 'SUPERSEDED' ? <div className={styles.reviewReason}><WarningOutlined /> 已被同一工作区的后续修改取代，不可确认或拒绝。</div> : null}{item.repositoryDeliveries.length > 1 ? <div className={styles.repositoryStrip}>{item.repositoryDeliveries.map((delivery) => <span key={delivery.repositoryId}>{delivery.repositoryName}: {delivery.deliveryStatus}</span>)}</div> : null}{item.mergeRequest ? <div className={styles.mrLine}>MR #{item.mergeRequest.number} · {item.mergeRequest.title}</div> : null}</>
 }
 
 function deliveryActionPendingText(action: DeliveryAction): string {
-  return ({ submitReview: '正在提交交付申请…', approve: '正在提交批准请求…', confirm: '正在提交交付确认…', reject: '正在提交拒绝请求…', archive: '正在提交归档请求…', retryDelivery: '正在提交重试请求…' } as Record<DeliveryAction, string>)[action]
+  return ({ submitReview: '正在提交交付申请…', approve: '正在提交批准请求…', confirm: '正在同步目标分支并确认交付…', reject: '正在提交拒绝请求…', archive: '正在提交归档请求…', retryDelivery: '正在同步目标分支并重试交付…' } as Record<DeliveryAction, string>)[action]
 }
 
 function codeReviewStatusLabel(status: CodeDeliveryItem['reviewStatus']): string {
-  return status === 'SUPERSEDED' ? '已被后续修改取代' : status
+  return status === 'PENDING_CONFIRMATION' ? '待确认' : status === 'ACCEPTED' ? '已确认' : status === 'REJECTED' ? '已拒绝' : '已被后续修改取代'
 }
 
 function MemoryDetails({ item }: { item: MemoryDeliveryItem }) {
-  return <><div className={styles.detailLine}><span><FileTextOutlined /> {item.category} · {item.visibility} · {item.resourceStatus}</span><span>{(item.sources ?? []).length > 0 ? `来源消息 ${(item.sources ?? []).map((source) => display(source.messageId)).join('、')}` : '无关联来源'}</span></div><div className={styles.excerpt}>{display(item.contentExcerpt)}</div><Tags tags={item.tags} /></>
+  const sourceText = item.requirementGroup?.name ? `来源群 ${item.requirementGroup.name}` : '无关联来源'
+  return <><div className={styles.detailLine}><span><FileTextOutlined /> {item.category} · {item.visibility} · {item.resourceStatus}</span><span>{sourceText}</span></div><div className={styles.excerpt}>{display(item.contentExcerpt)}</div><Tags tags={item.tags} /></>
 }
 
 function SkillDetails({ item }: { item: SkillDeliveryItem }) {
@@ -638,7 +687,12 @@ function hasActionableCapability(item: DeliveryItem): boolean {
     || capabilities.canRetryDelivery
 }
 
-function CodeActions({ item, active, onAction, onReject, onOpenResource }: { item: CodeDeliveryItem; active: boolean; onAction: (item: DeliveryItem, action: DeliveryAction) => Promise<void>; onReject: (item: DeliveryItem) => void; onOpenResource: (item: DeliveryItem) => void }) {
+function CodeActions({ item, active, onAction, onReject, onOpenResource, onOpenGroup }: { item: CodeDeliveryItem; active: boolean; onAction: (item: DeliveryItem, action: DeliveryAction) => Promise<void>; onReject: (item: DeliveryItem) => void; onOpenResource: (item: DeliveryItem) => void; onOpenGroup: (groupId: string) => void }) {
+  if (item.reviewStatus === 'REJECTED') {
+    return item.requirementGroup
+      ? <Button size="small" type="link" onClick={() => onOpenGroup(item.requirementGroup!.id)}>回群继续修改</Button>
+      : null
+  }
   return <>
     {item.capabilities.canOpenResource ? <Button size="small" icon={<CodeOutlined />} onClick={() => onOpenResource(item)}>查看 Diff</Button> : null}
     {item.capabilities.canApprove ? <Button size="small" type="primary" icon={<CheckCircleOutlined />} loading={active} disabled={active} onClick={() => void onAction(item, 'confirm')}>确认交付</Button> : null}
@@ -647,11 +701,33 @@ function CodeActions({ item, active, onAction, onReject, onOpenResource }: { ite
   </>
 }
 
-function DeliveryOverview({ summaryQuery, total, groupId }: { summaryQuery: ReturnType<typeof useDeliverySummary>; total: number; groupId?: string }) {
+function isDiffReviewBatch(value: unknown): value is DiffReviewBatch {
+  return Boolean(value && typeof value === 'object' && 'reviewStatus' in value && 'taskId' in value)
+}
+
+function synchronizeRejectedCodeItem(item: CodeDeliveryItem, batch: DiffReviewBatch): CodeDeliveryItem {
+  if (batch.reviewStatus !== 'REJECTED') return item
+  return {
+    ...item,
+    displayStatus: 'REJECTED',
+    resourceStatus: batch.deliveryStatus,
+    reviewStatus: 'REJECTED',
+    deliveryStatus: batch.deliveryStatus as CodeDeliveryItem['deliveryStatus'],
+    reviewReason: batch.reviewReason,
+    capabilities: {
+      ...item.capabilities,
+      canApprove: false,
+      canReject: false,
+      canRetryDelivery: false,
+    },
+  }
+}
+
+function DeliveryOverview({ summaryQuery, total, recentActivityQuery, onShowPending, onOpenResource }: { summaryQuery: ReturnType<typeof useDeliverySummary>; total: number; recentActivityQuery: ReturnType<typeof useInfiniteDeliveryItems>; onShowPending: () => void; onOpenResource: (item: DeliveryItem) => void }) {
   if (summaryQuery.isLoading) return <aside className={styles.sidebar}><Card className={styles.overviewCard}><Skeleton active /></Card><Card className={styles.overviewCard}><Skeleton active /></Card></aside>
   if (summaryQuery.isError || !summaryQuery.data) return <aside className={styles.sidebar}><Card className={styles.overviewCard}><Alert type="error" showIcon message="交付概览加载失败" description={errorText(summaryQuery.error)} action={<Button size="small" onClick={() => void summaryQuery.refetch()}>重试</Button>} /></Card><Card className={styles.overviewCard}><Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="仓库数据不可用" /></Card></aside>
 
-  const { countsByStatus, repositorySummaries, requirementGroupSummaries } = summaryQuery.data
+  const { countsByStatus, repositorySummaries } = summaryQuery.data
   const accepted = (countsByStatus.ACCEPTED ?? 0) + (countsByStatus.DELIVERED ?? 0)
   const processing = countsByStatus.PROCESSING ?? 0
   const failed = countsByStatus.FAILED ?? 0
@@ -669,20 +745,23 @@ function DeliveryOverview({ summaryQuery, total, groupId }: { summaryQuery: Retu
     <Card className={styles.overviewCard} title={<span>仓库交付状态 <Text type="secondary">{repositorySummaries.length} 个仓库</Text></span>}>
       {repositorySummaries.length === 0 ? <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无仓库交付" /> : <div className={styles.repositoryList}>{repositorySummaries.map((repository) => <div className={styles.repositoryRow} key={repository.repositoryId}><div><strong>{repository.repositoryName}</strong><span>{repository.accepted}/{repository.total} 已交付</span></div><div>{repository.deliveryStatus && repository.deliveryStatus !== 'NOT_STARTED' ? <Tag color={repository.failed > 0 ? 'red' : repository.pending > 0 ? 'orange' : 'green'}>{repository.deliveryStatus}</Tag> : null}{repository.mergeRequest ? <small>MR #{repository.mergeRequest.number}</small> : null}</div></div>)}</div>}
     </Card>
-    <Card className={styles.overviewCard} title={<span>待我处理 <Text type="secondary">{summaryQuery.data.pendingForCurrentUser}</Text></span>}>
-      <div className={styles.projectInfo}><SettingOutlined /><span>{summaryQuery.data.pendingForCurrentUser > 0 ? '当前筛选数据集中有待处理交付。' : '当前没有待处理交付。'}</span></div>
+    <Card className={styles.overviewCard} title={<span>待处理交付 <Text type="secondary">{summaryQuery.data.pendingForCurrentUser}</Text></span>}>
+      <div className={styles.pendingOverview}><span>{summaryQuery.data.pendingForCurrentUser > 0 ? '有交付等待你的确认或审核。' : '当前没有待处理交付。'}</span>{summaryQuery.data.pendingForCurrentUser > 0 ? <Button size="small" type="primary" onClick={onShowPending}>查看待处理</Button> : null}</div>
     </Card>
-    <Card className={styles.overviewCard} title="需求信息">
-      {groupId ? <GroupSummary summary={requirementGroupSummaries.find((group) => group.requirementGroupId === groupId)} /> : <div className={styles.projectInfo}><SettingOutlined /><span>当前展示项目级交付概览，可通过需求群筛选查看单组统计。</span></div>}
+    <Card className={styles.overviewCard} title="最近活动">
+      <RecentDeliveryActivities query={recentActivityQuery} onOpenResource={onOpenResource} />
     </Card>
   </aside>
 }
 
-function Legend({ color, label, value }: { color: string; label: string; value: number }) {
-  return <div><i style={{ background: color }} /><span>{label}</span><strong>{value}</strong></div>
+function RecentDeliveryActivities({ query, onOpenResource }: { query: ReturnType<typeof useInfiniteDeliveryItems>; onOpenResource: (item: DeliveryItem) => void }) {
+  const activities = useMemo(() => query.data?.pages.flatMap((page) => page.data).slice(0, 3) ?? [], [query.data])
+  if (query.isLoading) return <Skeleton active title={false} paragraph={{ rows: 3 }} />
+  if (query.isError) return <Button type="link" size="small" onClick={() => void query.refetch()}>重新加载活动</Button>
+  if (activities.length === 0) return <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无交付动态" />
+  return <div className={styles.recentActivityList}>{activities.map((item) => <button type="button" key={item.id} className={styles.recentActivityItem} onClick={() => onOpenResource(item)} disabled={!item.capabilities.canOpenResource}><ClockCircleOutlined /><div><strong>{item.title}</strong><span><Tag color={STATUS_COLORS[item.displayStatus]}>{STATUS_LABELS[item.displayStatus]}</Tag>{formatDate(item.updatedAt)}</span></div></button>)}</div>
 }
 
-function GroupSummary({ summary }: { summary: { requirementGroupId: string; name: string; total: number; pending: number } | undefined }) {
-  if (!summary) return <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="当前需求群暂无统计" />
-  return <div className={styles.projectInfo}><SettingOutlined /><div><strong>{summary.name}</strong><span>{summary.total} 个交付物，其中 {summary.pending} 个待审核</span></div></div>
+function Legend({ color, label, value }: { color: string; label: string; value: number }) {
+  return <div><i style={{ background: color }} /><span>{label}</span><strong>{value}</strong></div>
 }

@@ -108,8 +108,10 @@ export interface FileMessageContent {
   previewType?: string
 }
 
-/** QUOTE 引用消息内容：quotedText 为被引用消息的原始内容摘要，replyText 为回复者输入的正文 */
+/** QUOTE 引用消息内容：text 为通用消息正文；quotedText 为被引用消息的原始内容摘要，replyText 为回复者输入的正文 */
 export interface QuoteMessageContent {
+  /** 与 TEXT 消息同构的正文，供任务触发、群摘要等通用文本消费者读取。 */
+  text?: string
   quotedMessageId: string
   quotedText: string
   quotedSenderName?: string
@@ -133,6 +135,7 @@ export interface DiffMessageContent {
   /** 变更文件路径列表 */
   files?: string[]
   reviewStatus?: 'PENDING_CONFIRMATION' | 'ACCEPTED' | 'REJECTED'
+  reviewReason?: string | null
   deliveryStatus?: string
 }
 
@@ -182,7 +185,7 @@ export interface TaskStatusMessageContent {
   currentStepId?: string
   /** 当前 Task Workspace 已挂载的项目仓库；空数组表示尚未挂载仓库。 */
   repositoryMappings?: TaskStatusRepositoryMapping[]
-  /** 当前步骤实际涉及的仓库工作区路径（多仓库时用于过滤展示；空数组/缺失 = 展示全部） */
+  /** 当前步骤实际涉及的仓库工作区路径；空数组表示当前阶段尚未选定操作仓库，缺失表示旧卡片未提供范围。 */
   currentRepositoryPaths?: string[]
   plan?: {
     summary?: string

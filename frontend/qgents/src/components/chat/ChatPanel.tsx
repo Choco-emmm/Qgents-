@@ -18,7 +18,7 @@ import {
 } from '@ant-design/icons'
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient, type InfiniteData } from '@tanstack/react-query'
 import { formatApiError } from '@/utils/formatApiError'
-import { ApiError, groupApi, projectApi, attachmentApi, githubApi, uploadAttachment, memoryApi, tasksApi } from '@/api'
+import { ApiError, groupApi, projectApi, attachmentApi, uploadAttachment, memoryApi, tasksApi, mergeRequestsApi } from '@/api'
 import { resolvePreviewUrl } from '@/api/attachment'
 import { AttachmentPreviewModal } from '@/components/chat/AttachmentPreviewModal'
 import { ChatDiffCard } from '@/components/chat/ChatDiffCard'
@@ -27,6 +27,7 @@ import { useAuth } from '@/context/AuthContext'
 import { useAgents } from '@/hooks/agents'
 import { subscribeRealtimeReconnect } from '@/realtime'
 import { useProjectTaskPollingInterval } from '@/realtime/useProjectTaskDomainEvents'
+import './ChatPanel.css'
 import { ErrorBoundary } from '@/components/ErrorBoundary'
 import { TaskTriggerModal } from '@/components/task-domain'
 import { GroupMemberSettings } from '@/pages/ProjectDetail/GroupMemberSettings'
@@ -44,9 +45,11 @@ import type {
   ImageMessageContent,
   FileMessageContent,
   QuoteMessageContent,
+  DiffMessageContent,
   TaskStatusMessageContent,
   TaskStatusRepositoryMapping,
 } from '@/types'
+import type { TaskMergeRequestPreflightList } from '@/types/task-model'
 
 const { Text } = Typography
 
@@ -71,6 +74,69 @@ export function ChatPanel({ projectId, groupId }: { projectId: string; groupId: 
   const [settingsOpen, setSettingsOpen] = useState(false)
   // 回复引用：选中某条消息后，输入区显示引用条，发送时以 QUOTE 类型 + replyToId 提交
   const [replyTo, setReplyTo] = useState<Message | null>(null)
+
+  const quoteDiffBlockReason = useCallback((preflight: TaskMergeRequestPreflightList): string | null => {
+    for (const item of preflight.items) {
+      const mergeStatus = item.mergeRequest?.status
+      if (mergeStatus === 'MERGED') {
+        return '该 Diff 对应的 MR 已合并，当前不能引用继续修改。'
+      }
+      if (mergeStatus === 'CLOSED') {
+        return '该 Diff 对应的 MR 已关闭，当前不能引用继续修改。'
+      }
+      if (mergeStatus === 'OPEN' || item.status === 'MR_CREATED') {
+        return '该 Diff 已进入 MR 流程，当前不能引用继续修改。'
+      }
+      switch (item.status) {
+        case 'REQUESTED':
+        case 'DRY_RUN_QUEUED':
+        case 'DRY_RUN_RUNNING':
+          return '当前 Diff 正在进行 MR 预检，请等待预检完成后再引用继续修改。'
+        case 'WAITING_CQ':
+          return '当前 Diff 正在等待 CQ+1 审查，暂不能引用继续修改。'
+        case 'CREATING_MR':
+          return '当前 Diff 正在创建 MR，暂不能引用继续修改。'
+        default:
+          break
+      }
+    }
+    return null
+  }, [])
+
+  const handleReply = useCallback(async (target: Message) => {
+    if (target.type !== 'DIFF') {
+      setReplyTo(target)
+      return
+    }
+    const content = target.content as DiffMessageContent
+    const taskId = typeof content.taskId === 'string' ? content.taskId.trim() : ''
+    if (!taskId) {
+      message.error('当前 Diff 缺少任务上下文，暂时无法引用继续修改，请刷新页面后重试。')
+      return
+    }
+    try {
+      const preflight = await queryClient.fetchQuery({
+        queryKey: taskModelQueryKeys.mergeRequests.preflightByTask(projectId, taskId),
+        queryFn: () => mergeRequestsApi.getTaskPreflight(projectId, taskId),
+        staleTime: 0,
+      })
+      const blockReason = quoteDiffBlockReason(preflight)
+      if (blockReason) {
+        message.error(blockReason)
+        return
+      }
+      setReplyTo(target)
+      const reviewReason = typeof content.reviewReason === 'string' ? content.reviewReason.trim() : ''
+      if (content.reviewStatus === 'REJECTED' && reviewReason) {
+        setDraft((current) => current.trim()
+          ? current
+          : `请根据以下拒绝意见修改：\n${reviewReason}\n\n请继续修改：`)
+      }
+      requestAnimationFrame(() => inputRef.current?.focus())
+    } catch (error) {
+      message.error(`暂时无法确认当前 Diff 状态：${formatApiError(error)}`)
+    }
+  }, [message, projectId, queryClient, quoteDiffBlockReason])
   // 附件内联预览（增量契约 §4/§5）：点击 IMAGE/FILE 打开页内预览弹窗
   const [previewTarget, setPreviewTarget] = useState<{
     attachmentId: string
@@ -240,6 +306,17 @@ export function ChatPanel({ projectId, groupId }: { projectId: string; groupId: 
         eventType?: string
       }>).detail
       if (detail?.projectId !== projectId || detail.groupId !== groupId) return
+      if (detail.eventType === 'task.updated') {
+        // Task 可能先于 TASK_STATUS 消息落库；收到 task.updated 后补查几次，
+        // 让群聊进度卡片不必等到下一次完整刷新才出现。
+        void sync()
+        for (const delay of [500, 1500, 3000]) {
+          window.setTimeout(() => {
+            if (!stopped) void sync()
+          }, delay)
+        }
+        return
+      }
       // message.updated 复用原消息的 sequence，增量接口按 sequence 查询时不会返回它。
       // 失效整页查询，确保 TASK_STATUS 卡片用更新后的 content 替换旧的 PLANNING。
       if (detail.eventType === 'message.updated') {
@@ -528,6 +605,7 @@ export function ChatPanel({ projectId, groupId }: { projectId: string; groupId: 
     if (lastReadSeq == null || !currentUserId) return []
     return messages.filter(
       (m) =>
+        m.senderType !== 'AGENT' &&
         m.senderId !== currentUserId &&
         (m.sequence ?? 0) > lastReadSeq &&
         (m.mentions ?? []).some((mention) => mention.type === 'USER' && mention.id === currentUserId),
@@ -564,12 +642,14 @@ export function ChatPanel({ projectId, groupId }: { projectId: string; groupId: 
     const hasAutoJumpFlag =
       typeof mentionMessageId === 'string' || (location.state as { autoJumpMention?: boolean } | null)?.autoJumpMention === true
     if (!hasAutoJumpFlag) return
+    const isUserMention = (m: Message): boolean =>
+      m.senderType !== 'AGENT' &&
+      m.senderId !== currentUserId &&
+      (m.mentions ?? []).some((mention) => mention.type === 'USER' && mention.id === currentUserId)
     const target = mentionMessageId
-      ? messages.find((m) => m.id === mentionMessageId)
+      ? messages.find((m) => m.id === mentionMessageId && isUserMention(m))
       : messages.find(
-          (m) =>
-            m.senderId !== currentUserId &&
-            (m.mentions ?? []).some((mention) => mention.type === 'USER' && mention.id === currentUserId),
+          isUserMention,
         )
     if (target) {
       autoMentionJumpedRef.current = true
@@ -714,12 +794,16 @@ export function ChatPanel({ projectId, groupId }: { projectId: string; groupId: 
       return !!displayName && text.includes(displayName)
     })
     const hasAgentMention = effectiveMentions.some((mention) => mention.type === 'AGENT')
+    const taskText = taskTextFromReply(text, effectiveMentions, mentionDisplayName)
     setSending(true)
     setSendError(null)
     // 乐观发送：先本地构造一条临时消息（pending 转圈）插入缓存，避免等待后端返回期间"卡住没反应"
     const optimisticId = `cmsg_${Date.now()}`
     const optimisticContent = replyTo
       ? {
+          // QUOTE 同时提供通用 text 字段。自动建任务和群摘要按普通消息取正文时，
+          // 不应退化为序列化整个引用元数据对象。
+          text: taskText,
           quotedMessageId: replyTo.id,
           quotedText: quotePreview(replyTo),
           quotedSenderName: replyTo.senderName ?? (replyTo.senderType === 'AGENT' ? 'Agent' : '成员'),
@@ -780,28 +864,12 @@ export function ChatPanel({ projectId, groupId }: { projectId: string; groupId: 
           requirement: text,
         })
       } else if (hasAgentMention && canOpenTaskTrigger) {
-        try {
-          const repositories = await githubApi.listProjectRepositories(projectId)
-          if (repositories.length === 0) {
-            throw new Error('当前项目没有可用于创建任务的绑定仓库。')
-          }
-          // @agent 自动触发不指定公共基线分支：每个仓库用各自项目默认分支兜底，
-          // 避免「仓库 A 用 develop、仓库 B 用 master」时单一 baseRef 导致 409 GIT_BRANCH_NOT_FOUND。
-          await groupApi.triggerTask(projectId, groupId, sentMessage.id, {
-            title: taskTitleFromMessage(text),
-            requirement: text,
-            repositoryIds: repositories.map((repository) => repository.id),
-            baseRef: null,
-          })
+        // 普通 @编排助手消息由 MessageSentListener 在服务端自动建 Task。
+        // 这里不再并行调用 /trigger-task，避免自动触发尚未落库时重复创建任务
+        // 产生误报（任务随后仍由服务端按项目仓库范围异步创建）。
+        if (canOpenTaskTrigger) {
           void queryClient.invalidateQueries({ queryKey: ['qgents', 'projects', projectId, 'tasks'] })
-          message.success('任务已创建，正在生成执行方案。')
-        } catch (triggerError) {
-          if (triggerError instanceof ApiError && triggerError.status === 409) {
-            void queryClient.invalidateQueries({ queryKey: ['qgents', 'projects', projectId, 'tasks'] })
-            message.info('任务已由自动触发链创建，请在任务中心查看。')
-          } else {
-            message.warning('消息已发送，但任务触发失败，请稍后重试或联系项目管理员。')
-          }
+          message.info('需求已发送，任务正在后台创建。')
         }
       }
       return sentMessage
@@ -908,6 +976,7 @@ export function ChatPanel({ projectId, groupId }: { projectId: string; groupId: 
       <Layout style={{ height: '100%', background: token.colorBgBase }}>
       {/* 顶部：群标题 + 操作入口；多选模式下切换为「取消 | 已选择 N 条」 */}
       <div
+        className="chat-panel__header"
         style={{
           padding: '12px 20px',
           borderBottom: `1px solid ${token.colorBorder}`,
@@ -939,7 +1008,7 @@ export function ChatPanel({ projectId, groupId }: { projectId: string; groupId: 
               </div>
             </div>
           </div>
-          <Space size={8}>
+          <Space className="chat-panel__header-actions" size={8} wrap>
             {/* @Agent 发起任务入口 —— 打开 B 的 TaskTriggerModal；其余操作收进「群聊设置」栏 */}
             {canOpenTaskTrigger && <Button
               type="primary"
@@ -962,6 +1031,7 @@ export function ChatPanel({ projectId, groupId }: { projectId: string; groupId: 
       {/* 消息列表 */}
       <Layout.Content
         ref={listRef}
+        className="chat-panel__message-list"
         style={{
           flex: 1,
           overflowY: 'auto',
@@ -993,7 +1063,7 @@ export function ChatPanel({ projectId, groupId }: { projectId: string; groupId: 
         ) : messages.length === 0 ? (
           <Empty description="还没有消息，来说点什么吧" />
         ) : (
-          <div ref={contentRef} style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+          <div ref={contentRef} className="chat-panel__message-content" style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
             {/* 顶部：加载更早历史的分页指示 */}
             <div style={{ textAlign: 'center', padding: '8px 0' }}>
               {isFetchingNextPage ? (
@@ -1008,12 +1078,23 @@ export function ChatPanel({ projectId, groupId }: { projectId: string; groupId: 
                 </Text>
               )}
             </div>
-            {messages.map((m) => {
+            {messages.map((m, messageIndex) => {
               const isSelf = m.senderType === 'USER' && m.senderId === user?.id
+              const previousMessage = messages[messageIndex - 1]
+              const groupedWithPrevious = Boolean(
+                previousMessage &&
+                  previousMessage.senderType !== 'SYSTEM' &&
+                  m.senderType !== 'SYSTEM' &&
+                  previousMessage.senderType === m.senderType &&
+                  previousMessage.senderId === m.senderId &&
+                  previousMessage.type !== 'TASK_STATUS' &&
+                  m.type !== 'TASK_STATUS',
+              )
               const flashing = mentionFlashId === m.id
               return (
                 <div
                   key={m.id}
+                  className={groupedWithPrevious ? 'chat-panel__message-row chat-panel__message-row--grouped' : 'chat-panel__message-row'}
                   id={`msg-${m.id}`}
                   onContextMenu={
                     !isSelf && m.senderType !== 'SYSTEM'
@@ -1056,7 +1137,7 @@ export function ChatPanel({ projectId, groupId }: { projectId: string; groupId: 
                       selfDisplayName={user?.displayName ?? '我'}
                       projectId={projectId}
                       taskStatusById={taskStatusById}
-                      onReply={setReplyTo}
+                      onReply={handleReply}
                       onOpenFile={openFile}
                       onImageLoad={handleImageLoad}
                     />
@@ -1076,6 +1157,7 @@ export function ChatPanel({ projectId, groupId }: { projectId: string; groupId: 
             {/* 未读「@ 我」提示条：点击跳到被 @ 的那条消息，点击后按钮消失 */}
             {showMentionBar ? (
               <div
+                className="chat-panel__mention-jump"
                 onClick={jumpToMention}
                 role="button"
                 tabIndex={0}
@@ -1085,21 +1167,9 @@ export function ChatPanel({ projectId, groupId }: { projectId: string; groupId: 
                     jumpToMention()
                   }
                 }}
-                style={{
-                  position: 'sticky',
-                  bottom: 12,
-                  alignSelf: 'center',
-                  marginTop: 10,
-                  padding: '7px 16px',
-                  borderRadius: 999,
-                  background: 'rgba(245, 158, 11, 0.12)',
-                  border: '1px solid rgba(245, 158, 11, 0.4)',
-                  color: '#b45309',
-                  fontSize: 13,
-                  cursor: 'pointer',
-                }}
               >
-                ↑ 有人@你
+                <span aria-hidden>↑</span>
+                <span>有人@你{mentionMessages.length > 1 ? ` · ${mentionMessages.length} 条` : ''}</span>
               </div>
             ) : null}
           </div>
@@ -1108,7 +1178,7 @@ export function ChatPanel({ projectId, groupId }: { projectId: string; groupId: 
 
       {/* 底部输入区 */}
 
-        <div style={{ position: 'relative', padding: '12px 20px 16px', borderTop: `1px solid ${token.colorBorder}` }}>
+        <div className="chat-panel__composer" style={{ position: 'relative', padding: '12px 20px 16px', borderTop: `1px solid ${token.colorBorder}` }}>
           {/* @ 提及成员面板 */}
           {mentionOpen && (filteredAgents.length > 0 || filteredUsers.length > 0) && (
           <div
@@ -1185,7 +1255,7 @@ export function ChatPanel({ projectId, groupId }: { projectId: string; groupId: 
         )}
 
         {sendError ? <Text type="danger" style={{ display: 'block', marginBottom: 8 }}>{sendError}</Text> : null}
-        <Space.Compact style={{ width: '100%' }}>
+        <div className="chat-panel__composer-row">
           <Upload
             showUploadList={false}
             multiple={false}
@@ -1194,7 +1264,7 @@ export function ChatPanel({ projectId, groupId }: { projectId: string; groupId: 
               return false
             }}
           >
-            <Button icon={<PaperClipOutlined />} loading={uploading} aria-label="发送文件" />
+            <Button className="chat-panel__composer-tool" icon={<PaperClipOutlined />} loading={uploading} aria-label="发送文件" />
           </Upload>
           <Input.TextArea
             ref={inputRef}
@@ -1210,9 +1280,10 @@ export function ChatPanel({ projectId, groupId }: { projectId: string; groupId: 
                 handleSend()
               }
             }}
-            style={{ flex: 1 }}
+            className="chat-panel__composer-input"
           />
-          <Button
+            <Button
+            className="chat-panel__composer-send"
             type="primary"
             icon={<SendOutlined />}
             onClick={handleSend}
@@ -1221,7 +1292,7 @@ export function ChatPanel({ projectId, groupId }: { projectId: string; groupId: 
           >
             发送
           </Button>
-        </Space.Compact>
+        </div>
         </div>
 
       {/* @Agent 发起任务弹窗（B 的 TaskTriggerModal） */}
@@ -1323,6 +1394,28 @@ export function ChatPanel({ projectId, groupId }: { projectId: string; groupId: 
 function taskTitleFromMessage(text: string): string {
   const withoutLeadingMentions = text.replace(/(?:^|\s)@\S+/g, ' ').trim()
   return (withoutLeadingMentions || text).slice(0, 80)
+}
+
+/**
+ * 消息气泡保留 @ 提及以表达对 Agent 的指派；任务正文不应把它当作需求的一部分。
+ * 仅移除本次实际提及对象开头的名称，避免误删需求正文中的普通 @ 字符。
+ */
+function taskTextFromReply(
+  text: string,
+  mentions: readonly Mention[],
+  displayNameForMention: (mention: Mention) => string | undefined,
+): string {
+  let result = text.trim()
+  const names = mentions
+    .map(displayNameForMention)
+    .filter((name): name is string => Boolean(name))
+    .sort((left, right) => right.length - left.length)
+
+  for (const name of names) {
+    const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    result = result.replace(new RegExp(`^@${escapedName}(?:[\\s，,：:]+)?`), '').trim()
+  }
+  return result || text.trim()
 }
 
 /** 时间分隔线文案：今天 HH:mm / 昨天 HH:mm / M月D日 HH:mm（气泡时间展示用） */
@@ -1727,11 +1820,17 @@ function renderContent(
     case 'IMAGE': {
       const c = message.content as ImageMessageContent
       // 增量契约 §7：content.previewUrl 若由后端回填（带短期 token），直接用；
-      // 否则回退 AuthedImage 走 §18.5 content 代理（带 Bearer 拉取）
+      // 否则走 §18.5 content 代理（带 Bearer 拉取）。地址优先用 attachmentId 重建，
+      // 与存储的 content.url 前缀无关——历史消息 url 可能是 /api/... 或 /projects/...，
+      // 直接 normalizeContentUrl 会把已带 /api 的地址拼成 /api/api/... 双前缀 404。
+      // 缺 attachmentId 的旧消息才回退 normalizeContentUrl(c.url)。
       const previewUrl = typeof c.previewUrl === 'string' && c.previewUrl ? resolvePreviewUrl(c.previewUrl) : null
+      const contentUrl = c.attachmentId
+        ? attachmentApi.contentUrl(projectId, c.attachmentId)
+        : normalizeContentUrl(c.url)
       const image = (
         <AuthedImage
-          src={previewUrl ?? normalizeContentUrl(c.url)}
+          src={previewUrl ?? contentUrl}
           width={c.width ?? 260}
           height={c.height}
           style={{ borderRadius: 10, display: 'block', maxWidth: '100%' }}
@@ -1785,10 +1884,36 @@ function renderContent(
       // 多仓库：currentRepositoryPaths 非空时只展示当前步骤实际涉及的仓库（按 workspacePath 匹配）
       const currentPaths = c.currentRepositoryPaths
       const repositoryMappings = normalizeTaskStatusRepositoryMappings(c.repositoryMappings).filter(
-        (mapping) => !currentPaths || currentPaths.length === 0 || currentPaths.includes(mapping.workspacePath),
+        (mapping) => currentPaths === undefined || currentPaths.includes(mapping.workspacePath),
       )
-      const statusKey = c.status?.toUpperCase()
-      const displayStatus = taskStatus ?? c.status
+      const messageStatus = c.status?.toUpperCase()
+      const queriedStatus = taskStatus?.toUpperCase()
+      const hasRunningStep = steps.some((step) => step.status === 'RUNNING')
+      // 消息和任务查询可能短暂不同步：步骤已开始执行时，避免旧的 PLANNING 覆盖真实运行态。
+      // 同样地，任务状态卡本身已经携带了 WAITING_DIFF_CONFIRMATION /
+      // WAITING_PREFLIGHT 等用户动作态；若任务列表仍缓存 RUNNING，不能让卡片
+      // 把已经完成开发的任务继续显示成“执行中”。一旦查询返回更晚的非运行态，
+      // 查询结果仍优先。
+      const staleQueriedStatus = !queriedStatus
+        || queriedStatus === 'PLANNING'
+        || queriedStatus === 'PENDING'
+        || queriedStatus === 'RUNNING'
+        || queriedStatus === 'IN_PROGRESS'
+      const messageHasTerminalOrWaitingStatus = Boolean(messageStatus && [
+        'WAITING_DIFF_CONFIRMATION',
+        'WAITING_PREFLIGHT',
+        'DELIVERING',
+        'DELIVERY_FAILED',
+        'SUCCEEDED',
+        'FAILED',
+        'CANCELLED',
+      ].includes(messageStatus))
+      const displayStatus = messageHasTerminalOrWaitingStatus && staleQueriedStatus
+        ? messageStatus
+        : queriedStatus === 'PLANNING' && (messageStatus !== 'PLANNING' || hasRunningStep)
+          ? (messageStatus && messageStatus !== 'PLANNING' ? messageStatus : 'RUNNING')
+          : (queriedStatus ?? messageStatus ?? 'PLANNING')
+      const statusKey = displayStatus.toUpperCase()
       const diffReady =
         statusKey === 'WAITING_DIFF_CONFIRMATION' ||
         statusKey === 'DELIVERING' ||
@@ -1972,6 +2097,8 @@ function taskStatusColor(status: string): string {
   const s = status.toUpperCase()
   if (s === 'SUCCEEDED' || s === 'COMPLETED') return 'green'
   if (s === 'FAILED' || s === 'CANCELLED') return 'red'
+  if (s === 'WAITING_DIFF_CONFIRMATION' || s === 'WAITING_PREFLIGHT') return 'gold'
+  if (s === 'DELIVERY_FAILED') return 'red'
   if (s === 'RUNNING' || s === 'IN_PROGRESS') return 'blue'
   return 'default'
 }
