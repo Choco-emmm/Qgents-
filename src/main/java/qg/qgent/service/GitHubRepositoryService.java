@@ -21,9 +21,12 @@ import java.time.Clock;
 import java.time.LocalDateTime;
 import java.time.OffsetDateTime;
 import java.util.HashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
@@ -111,18 +114,18 @@ public class GitHubRepositoryService {
 
     /**
      * 列出指定团队已安装的 GitHub App 授权记录。
-     * 只有 Team Owner 才能执行此操作。
+     * Team Owner 或项目管理员可读取；安装/解除等变更操作仍要求 Team Owner。
      *
      * @param actorId 操作人的用户 ID
      * @param teamId  团队 ID
      * @return 包含该团队所有有效安装记录的响应列表
      */
     public List<GitHubInstallationResponse> listInstallations(UUID actorId, UUID teamId) {
-        // 权限校验：必须是团队所有者
-        requireTeamOwner(actorId, teamId);
-        // 查询数据库中属于该团队的安装记录，按更新时间倒序排列
-        requireTeamOwner(actorId, teamId);
-        // 返回团队的所有安装
+        // 只读查询与团队授权仓库列表保持一致：Team Owner 或该团队项目管理员可查看。
+        if (!hasTeamRepositoryAccess(teamId, actorId)) {
+            throw forbidden("Team owner or project admin access is required");
+        }
+        // 查询数据库中属于该团队的安装记录，按更新时间倒序排列。
         return installationMapper.selectList(new LambdaQueryWrapper<GitHubInstallationEntity>()
                         .eq(GitHubInstallationEntity::getTeamId, teamId)
                         .orderByDesc(GitHubInstallationEntity::getUpdatedAt))
@@ -323,6 +326,13 @@ public class GitHubRepositoryService {
                     || !installation.getAccountLogin().equalsIgnoreCase(credential.githubLogin())) {
                 throw new ApiException(HttpStatus.CONFLICT, "GITHUB_OAUTH_ACCOUNT_MISMATCH",
                         "当前 OAuth 账号与 GitHub App 安装账号不一致");
+            }
+            // 只有明确同步到 ALL 的 Installation 才允许自动建仓；NULL 也必须先同步，
+            // 避免在授权范围未知时先创建远程仓库再失败。
+            if (!"ALL".equalsIgnoreCase(installation.getRepositorySelection())) {
+                throw new ApiException(HttpStatus.FORBIDDEN,
+                        "GITHUB_INSTALLATION_REPOSITORY_SCOPE_INSUFFICIENT",
+                        "个人 GitHub App 安装当前仅授权了部分仓库，请在 GitHub App 设置中改为授权全部仓库后重试");
             }
             if (privateRepository && !credential.hasScope("repo")) {
                 throw new ApiException(HttpStatus.FORBIDDEN, "GITHUB_OAUTH_SCOPE_INSUFFICIENT",
@@ -744,16 +754,36 @@ public class GitHubRepositoryService {
 
     /**
      * 校验 installation 是否已被其他团队占用：返回 null 表示可绑定，否则返回冲突错误码。
-     * 回调场景使用，避免冲突直接抛异常导致网关把 409 转成 502。
+     * 仅当安装仍被其他团队活跃占用（存在 AUTHORIZED 仓库）时判定冲突；已删除/挂起或无可用仓库的
+     * 历史安装不阻塞，允许当前发起团队接管。回调场景使用，避免冲突直接抛异常导致网关把 409 转成 502。
      */
     private String installationTeamConflict(long providerInstallationId, UUID teamId) {
         GitHubInstallationEntity existing = installationMapper.selectOne(
                 new LambdaQueryWrapper<GitHubInstallationEntity>().eq(
                         GitHubInstallationEntity::getProviderInstallationId, providerInstallationId));
-        if (existing != null && !existing.getTeamId().equals(teamId)) {
+        if (existing != null && !existing.getTeamId().equals(teamId)
+                && isInstallationBlockingReassignment(existing)) {
             return "GITHUB_INSTALLATION_TEAM_CONFLICT";
         }
         return null;
+    }
+
+    private boolean isInstallationBlockingReassignment(GitHubInstallationEntity installation) {
+        if (installation == null || "DELETED".equalsIgnoreCase(installation.getStatus())) {
+            return false;
+        }
+        return hasAuthorizedRepositories(installation.getId());
+    }
+
+    /**
+     * 安装是否仍被活跃使用：其下存在 AUTHORIZED 状态的仓库镜像。
+     * 没有可用仓库的安装视为闲置，允许其他团队在 GitHub 重新授权后接管归属。
+     */
+    private boolean hasAuthorizedRepositories(UUID installationId) {
+        Long count = repositoryMapper.selectCount(new LambdaQueryWrapper<GitHubRepositoryEntity>()
+                .eq(GitHubRepositoryEntity::getInstallationId, installationId)
+                .eq(GitHubRepositoryEntity::getAuthorizationStatus, "AUTHORIZED"));
+        return count != null && count > 0;
     }
 
     /**
@@ -779,27 +809,126 @@ public class GitHubRepositoryService {
      */
     private GitHubInstallationResponse syncInstallation(UUID teamId, long providerInstallationId) {
         // 锁外拉取 GitHub 快照：不持有数据库事务或行锁
-        GitHubInstallationDetails installation = gitHubClient.getInstallation(providerInstallationId);
-        List<GitHubRepositoryDetails> providerRepositories = gitHubClient.listRepositories(providerInstallationId);
+        GitHubInstallationDetails installation;
+        List<GitHubRepositoryDetails> providerRepositories;
+        try {
+            installation = gitHubClient.getInstallation(providerInstallationId);
+            providerRepositories = gitHubClient.listRepositories(providerInstallationId);
+        } catch (ApiException exception) {
+            if ("GITHUB_INSTALLATION_NOT_FOUND".equals(exception.code())) {
+                return markInstallationDeleted(teamId, providerInstallationId);
+            }
+            throw exception;
+        }
+
+        // GitHub may deliver installation.deleted before the local installation row exists,
+        // or the webhook may be missed entirely. Reconcile repository mirrors whose old
+        // installation no longer exists before the takeover checks run in the transaction.
+        Set<Long> deletedInstallationIds = findDeletedInstallations(
+                providerInstallationId, providerRepositories);
 
         return required.execute(status -> syncInstallationInTransaction(teamId, providerInstallationId,
-                installation, providerRepositories));
+                installation, providerRepositories, deletedInstallationIds));
+    }
+
+    private Set<Long> findDeletedInstallations(long currentProviderInstallationId,
+                                                List<GitHubRepositoryDetails> providerRepositories) {
+        if (providerRepositories == null || providerRepositories.isEmpty()) {
+            return Set.of();
+        }
+        List<Long> providerRepositoryIds = providerRepositories.stream()
+                .map(GitHubRepositoryDetails::getRepositoryId)
+                .filter(Objects::nonNull)
+                .toList();
+        if (providerRepositoryIds.isEmpty()) {
+            return Set.of();
+        }
+
+        List<GitHubRepositoryEntity> mirrors = repositoryMapper.selectList(
+                new LambdaQueryWrapper<GitHubRepositoryEntity>()
+                        .in(GitHubRepositoryEntity::getProviderRepositoryId, providerRepositoryIds));
+        Set<Long> candidateInstallationIds = new LinkedHashSet<>();
+        for (GitHubRepositoryEntity mirror : mirrors) {
+            GitHubInstallationEntity oldInstallation = installationMapper.selectById(mirror.getInstallationId());
+            if (oldInstallation == null || oldInstallation.getProviderInstallationId() == null
+                    || oldInstallation.getProviderInstallationId() == currentProviderInstallationId) {
+                continue;
+            }
+            candidateInstallationIds.add(oldInstallation.getProviderInstallationId());
+        }
+
+        Set<Long> deleted = new LinkedHashSet<>();
+        for (Long candidateInstallationId : candidateInstallationIds) {
+            try {
+                gitHubClient.getInstallation(candidateInstallationId);
+            } catch (ApiException exception) {
+                if ("GITHUB_INSTALLATION_NOT_FOUND".equals(exception.code())) {
+                    deleted.add(candidateInstallationId);
+                    continue;
+                }
+                throw exception;
+            }
+        }
+        return deleted;
+    }
+
+    /**
+     * GitHub 已删除 Installation 时，将本地授权收敛为失效状态，保留历史外键引用。
+     * 该路径用于手动同步和 Configure 回调，作为 Webhook 丢失或竞态时的兜底。
+     */
+    private GitHubInstallationResponse markInstallationDeleted(UUID teamId, long providerInstallationId) {
+        return required.execute(status -> {
+            GitHubInstallationEntity installation = installationMapper
+                    .selectByProviderInstallationIdForUpdate(providerInstallationId);
+            if (installation == null) {
+                throw new ApiException(HttpStatus.NOT_FOUND, "GITHUB_INSTALLATION_NOT_FOUND",
+                        "GitHub App Installation 不存在或尚未绑定到该团队");
+            }
+            if (!teamId.equals(installation.getTeamId())) {
+                throw new ApiException(HttpStatus.FORBIDDEN, "GITHUB_REPOSITORY_ACCESS_DENIED",
+                        "GitHub App Installation 不属于当前团队");
+            }
+            LocalDateTime now = LocalDateTime.now(clock);
+            installation.setStatus("DELETED");
+            installation.setUpdatedAt(now);
+            installationMapper.updateById(installation);
+
+            List<GitHubRepositoryEntity> repositories = repositoryMapper.selectList(
+                    new LambdaQueryWrapper<GitHubRepositoryEntity>()
+                            .eq(GitHubRepositoryEntity::getInstallationId, installation.getId()));
+            for (GitHubRepositoryEntity repository : repositories) {
+                if (!"REVOKED".equals(repository.getAuthorizationStatus())) {
+                    repository.setAuthorizationStatus("REVOKED");
+                    repository.setSyncedAt(now);
+                    repositoryMapper.updateById(repository);
+                }
+            }
+            return toInstallationResponse(installation);
+        });
     }
 
     private GitHubInstallationResponse syncInstallationInTransaction(UUID teamId, long providerInstallationId,
                                                                     GitHubInstallationDetails installation,
-                                                                    List<GitHubRepositoryDetails> providerRepositories) {
+                                                                    List<GitHubRepositoryDetails> providerRepositories,
+                                                                    Set<Long> deletedInstallationIds) {
         // 行锁内读取并复查状态：与 Webhook 的 installation/suspend 事件按 Installation 串行
         GitHubInstallationEntity installationEntity = installationMapper.selectByProviderInstallationIdForUpdate(providerInstallationId);
 
+        for (Long deletedInstallationId : deletedInstallationIds) {
+            markInstallationDeletedInTransaction(deletedInstallationId);
+        }
+
         boolean newInstallation = installationEntity == null;
 
-        if (!newInstallation && !installationEntity.getTeamId().equals(teamId)) {
+        // 归属冲突只针对仍被其他团队活跃占用的安装（存在 AUTHORIZED 仓库）。
+        // 已删除/挂起或无可用仓库的历史安装不阻塞：允许当前发起团队接管（见下方 repoint）。
+        if (!newInstallation && !installationEntity.getTeamId().equals(teamId)
+                && isInstallationBlockingReassignment(installationEntity)) {
             throw new ApiException(HttpStatus.CONFLICT, "GITHUB_INSTALLATION_TEAM_CONFLICT",
                     "This GitHub installation is already bound to another team");
         }
-        // 已存在且被 Webhook suspend/deleted：不得用旧快照恢复 ACTIVE/AUTHORIZED，直接返回当前状态
-        if (!newInstallation && !"ACTIVE".equals(installationEntity.getStatus())) {
+        // 已存在且被 Webhook 置为 SUSPENDED：安装仍被 GitHub 挂起，不得恢复 ACTIVE/AUTHORIZED，直接返回当前状态
+        if (!newInstallation && "SUSPENDED".equals(installationEntity.getStatus())) {
             return toInstallationResponse(installationEntity);
         }
 
@@ -807,12 +936,25 @@ public class GitHubRepositoryService {
             installationEntity = new GitHubInstallationEntity();
             installationEntity.setId(UUID.randomUUID());
             installationEntity.setTeamId(teamId);
+        } else if (!installationEntity.getTeamId().equals(teamId)) {
+            // 接管其他团队的闲置安装（无 AUTHORIZED 仓库）：重新归属当前发起团队并恢复绑定。
+            // 只有本请求刚成功拉取 GitHub 实时快照（getInstallation/listRepositories 均成功）才走到这里，
+            // 不会被陈旧快照误恢复；GitHub 侧已确认用户重新授权了该安装。
+            installationEntity.setTeamId(teamId);
         }
 
         installationEntity.setProviderInstallationId(installation.getInstallationId());
         installationEntity.setAccountLogin(installation.getAccountLogin());
         installationEntity.setAccountType(normalizeEnum(installation.getAccountType()));
+        installationEntity.setRepositorySelection(normalizeRepositorySelection(installation.getRepositorySelection()));
         installationEntity.setStatus("ACTIVE");
+        // created_at/updated_at 显式写 UTC（注入的 clock 为 systemUTC）：DB 默认 CURRENT_TIMESTAMP
+        // 在 +08 服务器上会落本地时间，前端按契约把 installedAt 当 UTC 解析时就会偏 8 小时。
+        LocalDateTime now = LocalDateTime.now(clock);
+        if (newInstallation) {
+            installationEntity.setCreatedAt(now);
+        }
+        installationEntity.setUpdatedAt(now);
 
         if (newInstallation) {
             installationMapper.insert(installationEntity);
@@ -820,7 +962,6 @@ public class GitHubRepositoryService {
             installationMapper.updateById(installationEntity);
         }
 
-        LocalDateTime now = LocalDateTime.now(clock);
         List<Long> returnedProviderRepoIds = providerRepositories.stream()
                 .map(GitHubRepositoryDetails::getRepositoryId).toList();
 
@@ -851,10 +992,19 @@ public class GitHubRepositoryService {
             } else if (!installationEntity.getId().equals(repositoryEntity.getInstallationId())) {
                 GitHubInstallationEntity existingRepositoryInstallation = installationMapper
                         .selectById(repositoryEntity.getInstallationId());
-                if (existingRepositoryInstallation == null
-                        || !teamId.equals(existingRepositoryInstallation.getTeamId())) {
+                boolean sameTeam = existingRepositoryInstallation != null
+                        && teamId.equals(existingRepositoryInstallation.getTeamId());
+                boolean canTakeoverRevokedRepository = existingRepositoryInstallation != null
+                        && !sameTeam
+                        && !isInstallationBlockingReassignment(existingRepositoryInstallation)
+                        && ("REVOKED".equalsIgnoreCase(repositoryEntity.getAuthorizationStatus())
+                        || "DELETED".equalsIgnoreCase(existingRepositoryInstallation.getStatus()));
+                if (!sameTeam && !canTakeoverRevokedRepository) {
                     throw new ApiException(HttpStatus.CONFLICT, "GITHUB_INSTALLATION_TEAM_CONFLICT",
                             "This GitHub repository is already bound to another team installation");
+                }
+                if (canTakeoverRevokedRepository) {
+                    unbindProjectRepositoryReferences(repositoryEntity.getId());
                 }
                 // Keep the repository UUID so existing project repository bindings remain valid.
                 repositoryEntity.setInstallationId(installationEntity.getId());
@@ -889,6 +1039,50 @@ public class GitHubRepositoryService {
         }
 
         return toInstallationResponse(installationEntity);
+    }
+
+    private void markInstallationDeletedInTransaction(long providerInstallationId) {
+        GitHubInstallationEntity installation = installationMapper.selectByProviderInstallationIdForUpdate(
+                providerInstallationId);
+        if (installation == null || "DELETED".equalsIgnoreCase(installation.getStatus())) {
+            return;
+        }
+        LocalDateTime now = LocalDateTime.now(clock);
+        installation.setStatus("DELETED");
+        installation.setUpdatedAt(now);
+        installationMapper.updateById(installation);
+
+        List<GitHubRepositoryEntity> repositories = repositoryMapper.selectList(
+                new LambdaQueryWrapper<GitHubRepositoryEntity>()
+                        .eq(GitHubRepositoryEntity::getInstallationId, installation.getId()));
+        for (GitHubRepositoryEntity repository : repositories) {
+            if (!"REVOKED".equalsIgnoreCase(repository.getAuthorizationStatus())) {
+                repository.setAuthorizationStatus("REVOKED");
+                repository.setSyncedAt(now);
+                repositoryMapper.updateById(repository);
+            }
+        }
+    }
+
+    /**
+     * 跨团队接管已撤权仓库时，旧项目绑定不能继续作为 ACTIVE 绑定存在；保留记录以维持历史外键。
+     * 活跃任务仍占用该绑定时拒绝接管，避免运行中的任务突然失去仓库凭据。
+     */
+    private void unbindProjectRepositoryReferences(UUID repositoryId) {
+        List<ProjectRepositoryEntity> bindings = projectRepositoryMapper.selectList(
+                new LambdaQueryWrapper<ProjectRepositoryEntity>()
+                        .eq(ProjectRepositoryEntity::getRepositoryId, repositoryId)
+                        .eq(ProjectRepositoryEntity::getStatus, "ACTIVE"));
+        LocalDateTime now = LocalDateTime.now(clock);
+        for (ProjectRepositoryEntity binding : bindings) {
+            if (taskMapper.countActiveTasksUsingRepository(binding.getId()) > 0) {
+                throw new ApiException(HttpStatus.CONFLICT, "GITHUB_INSTALLATION_IN_USE",
+                        "旧团队项目仍有进行中的任务使用该仓库，请先完成或停止任务");
+            }
+            binding.setStatus("UNBOUND");
+            binding.setUnboundAt(now);
+            projectRepositoryMapper.updateById(binding);
+        }
     }
 
     private void requireTeamOwner(UUID actorId, UUID teamId) {
@@ -982,7 +1176,13 @@ public class GitHubRepositoryService {
     private GitHubInstallationResponse toInstallationResponse(GitHubInstallationEntity installation) {
         return new GitHubInstallationResponse(installation.getId(), installation.getProviderInstallationId(),
                 installation.getAccountLogin(), installation.getAccountType(), installation.getStatus(),
-                installation.getCreatedAt(), installation.getUpdatedAt());
+                installation.getRepositorySelection(), installation.getCreatedAt(), installation.getUpdatedAt());
+    }
+
+    private String normalizeRepositorySelection(String value) {
+        if (value == null || value.isBlank()) return null;
+        String normalized = value.trim().toUpperCase(Locale.ROOT);
+        return "ALL".equals(normalized) || "SELECTED".equals(normalized) ? normalized : null;
     }
 
     private GitHubRepositoryResponse toRepositoryResponse(GitHubRepositoryEntity repository) {

@@ -1,5 +1,5 @@
-import { useMemo, useRef, useState } from 'react'
-import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { Link, useParams, useSearchParams } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
 import {
   Alert,
@@ -57,9 +57,7 @@ import { commentAuthorName, HUNK_UNAVAILABLE_HINT } from '../commentAuthor'
 import { findCqCheck, isMergeRequestAuthor } from '../cqSeal'
 import { githubPullRequestUrl } from '../mergeRequestDisplay'
 import { qualityGateNodeHref } from '../qualityGateNav'
-import { FlowStepper } from '../components/FlowStepper/FlowStepper'
 import { CqSealCard } from './CqSealCard'
-import { CommitHistoryCard } from './CommitHistoryCard'
 import styles from './MergeRequestDetailPage.module.scss'
 
 const { Text } = Typography
@@ -107,29 +105,12 @@ export default function MergeRequestDetailPage() {
     mergeRequestId: string
   }>()
   const [searchParams, setSearchParams] = useSearchParams()
-  const navigate = useNavigate()
   const viewParam = searchParams.get('view')
   const view: DetailView = isDetailView(viewParam) ? viewParam : 'gate'
   const [fileIndex, setFileIndex] = useState(0)
   const [draft, setDraft] = useState('')
   const cqRef = useRef<HTMLDivElement>(null)
-
-  /**
-   * 点击流程图 CQ+1 节点：跳转到独立的大印章审查页（CqReviewPage）。
-   * 按产品新约定：MR 详情页、MR 列表条目都不再作为大印章页入口，
-   * 只允许从流程图的 CQ+1 节点进入审查页。
-   */
-  function navigateToCqReview(): void {
-    if (!mr) return
-    const to = `${PATHS.projectCqReview(projectId)}?mr=${encodeURIComponent(mr.id)}`
-    navigate(to)
-  }
-
-  function handleCreateMr() {
-    if (!mr) return
-    const to = `${PATHS.projectDiffs(projectId)}?tab=mr`
-    window.location.href = to
-  }
+  const isPlaceholder = mergeRequestId.startsWith('pending-mr:')
 
   const { data: project } = useQuery({
     queryKey: ['projects', projectId],
@@ -147,8 +128,9 @@ export default function MergeRequestDetailPage() {
     enabled: Boolean(projectId),
   })
 
-  const detailQuery = useMergeRequest(projectId, mergeRequestId)
-  const checksQuery = useMergeRequestChecks(projectId, mergeRequestId)
+  // PENDING_CREATE 是列表投影，不是数据库 MR，不能拿占位 ID 请求真实详情接口。
+  const detailQuery = useMergeRequest(projectId, isPlaceholder ? '' : mergeRequestId)
+  const checksQuery = useMergeRequestChecks(projectId, isPlaceholder ? '' : mergeRequestId)
   const syncMr = useSyncMergeRequest(projectId)
   const mergeMr = useMergeMergeRequest(projectId)
   const approveCq = useApproveMergeRequestCq(projectId)
@@ -171,7 +153,7 @@ export default function MergeRequestDetailPage() {
   const members = membersQuery.data ?? []
   const safeIndex = Math.min(fileIndex, Math.max(files.length - 1, 0))
   const current = files[safeIndex]
-  const listToMr = `${PATHS.projectCode(projectId)}?tab=mr`
+  const listToMr = PATHS.projectTestset(projectId)
   const repoName = repoLabel(reposQuery.data ?? [], mr?.repositoryId ?? '')
   const githubUrl = mr
     ? githubPullRequestUrl(
@@ -181,6 +163,16 @@ export default function MergeRequestDetailPage() {
     )
     : null
   const showMerge = canShowMergeButton(project?.role, mr)
+
+  // GitHub 合并由后端异步执行（接口先返回 202），合并期间定期拉取真实状态，
+  // 避免用户停留在详情页时一直看到旧的 OPEN 状态。
+  useEffect(() => {
+    if (!mr || mr.mergeOperationStatus !== 'RUNNING') return
+    const timer = window.setInterval(() => {
+      void detailQuery.refetch()
+    }, 3_000)
+    return () => window.clearInterval(timer)
+  }, [detailQuery.refetch, mr?.id, mr?.mergeOperationStatus])
 
   function setView(next: string) {
     const params = new URLSearchParams(searchParams)
@@ -219,14 +211,23 @@ export default function MergeRequestDetailPage() {
       title: '合并该 MR？',
       content: '仅 Project Admin 可在质量门禁全部通过后合并。合并后不可从本页撤销。',
       okText: '确认合并',
-      onOk: () =>
-        mergeMr.mutateAsync(mr.id).then(
-          () => message.success('已合并'),
-          (error: unknown) => {
-            message.error(formatApiError(error))
-            return Promise.reject(error)
-          },
-        ),
+      onOk: async () => {
+        try {
+          const result = await mergeMr.mutateAsync({ mergeRequestId: mr.id })
+          if (result.status === 'MERGED' || result.mergeOperationStatus === 'COMPLETED') {
+            message.success('MR 已合并')
+          } else if (result.mergeOperationStatus === 'RUNNING') {
+            message.info('合并请求已受理，正在同步 GitHub 状态')
+          } else if (result.mergeOperationStatus === 'FAILED') {
+            message.error('GitHub 合并失败，请查看错误提示后重试')
+          } else {
+            message.info('合并状态已更新，请稍后查看')
+          }
+        } catch (error: unknown) {
+          message.error(formatApiError(error))
+          throw error
+        }
+      },
     })
   }
 
@@ -311,7 +312,7 @@ export default function MergeRequestDetailPage() {
         <Alert
           type="error"
           showIcon
-          message={detailQuery.error ? formatApiError(detailQuery.error) : '该 MR 不存在或不可见'}
+          message={isPlaceholder ? '该记录仍在预检/待创建阶段，尚未生成真实 MR' : (detailQuery.error ? formatApiError(detailQuery.error) : '该 MR 不存在或不可见')}
           action={
             <Button size="small" onClick={() => void detailQuery.refetch()}>
               重试
@@ -325,9 +326,6 @@ export default function MergeRequestDetailPage() {
   const gateNodes = qualityGateNodes(checksQuery.data, mr)
   const cqCheck = findCqCheck(checksQuery.data)
   const isAuthor = isMergeRequestAuthor(user?.id, taskQuery.data?.createdByUser?.id)
-
-  const gatePassed = gateNodes.length > 0 && gateNodes.every((n) => n.status === 'PASSED')
-  const cqStatus = cqCheck?.status ?? 'PENDING'
 
   return (
     <div className={styles.page}>
@@ -379,31 +377,16 @@ export default function MergeRequestDetailPage() {
           {showMerge ? (
             <Button
               type="primary"
-              loading={mergeMr.isPending}
+              loading={mergeMr.isPending || mr.mergeOperationStatus === 'RUNNING'}
+              disabled={mr.mergeOperationStatus === 'RUNNING'}
               onClick={handleMerge}
               aria-label="merge-merge-request"
             >
-              合并
+              {mr.mergeOperationStatus === 'RUNNING' ? '合并中' : '合并'}
             </Button>
           ) : null}
         </div>
       </header>
-
-      <FlowStepper
-        projectId={projectId}
-        status={{
-          gate: gatePassed ? 'passed' : gateNodes.some((n) => n.status === 'FAILED') ? 'failed' : 'pending',
-          cq: cqStatus === 'PASSED' ? 'approved' : cqStatus === 'FAILED' ? 'rejected' : 'pending',
-          createMr: gatePassed && cqStatus === 'PASSED',
-        }}
-        mrCreated={Boolean(mr)}
-        onClickGate={() => {
-          const mrParam = `?mr=${encodeURIComponent(mr.id)}`
-          window.location.href = `${PATHS.projectQualityGate(projectId)}${mrParam}`
-        }}
-        onClickCq={navigateToCqReview}
-        onClickCreateMr={handleCreateMr}
-      />
 
       {project?.role === 'PROJECT_ADMIN' && mr.status === 'OPEN' && mr.qualityGate?.status !== 'PASSED' ? (
         <Alert
@@ -440,8 +423,6 @@ export default function MergeRequestDetailPage() {
                     </div>
                   )}
                   <CqSealCard
-                    projectId={projectId}
-                    mergeRequestId={mr.id}
                     check={cqCheck}
                     headCommit={mr.headCommit}
                     mrStatus={mr.status}
@@ -452,7 +433,6 @@ export default function MergeRequestDetailPage() {
                     rootRef={cqRef}
                   />
                 </section>
-                <CommitHistoryCard projectId={projectId} mergeRequestId={mr.id} />
               </Space>
             ),
           },
@@ -679,7 +659,10 @@ function canShowMergeButton(
   role: ProjectRole | undefined,
   mr: MergeRequestSummary | undefined,
 ): boolean {
-  return role === 'PROJECT_ADMIN' && mr?.status === 'OPEN' && mr.qualityGate?.status === 'PASSED'
+  return role === 'PROJECT_ADMIN'
+    && mr?.status === 'OPEN'
+    && mr.qualityGate?.status === 'PASSED'
+    && mr.mergeOperationStatus !== 'RUNNING'
 }
 
 function pickRelatedDiff(items: DiffListItem[], mr: MergeRequestSummary): DiffListItem | undefined {

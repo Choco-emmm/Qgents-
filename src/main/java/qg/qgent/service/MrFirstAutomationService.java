@@ -21,6 +21,7 @@ import qg.qgent.mapper.MrPreflightRequestMapper;
 import qg.qgent.mapper.ProjectRepositoryMapper;
 import qg.qgent.mapper.TaskMapper;
 import qg.qgent.mapper.WorkspaceRepositoryMapper;
+import qg.qgent.orchestration.ExecutionContentSanitizer;
 import qg.qgent.service.event.MrFirstPreflightRequestedDomainEvent;
 import qg.qgent.service.event.PreflightCqApprovedDomainEvent;
 
@@ -42,8 +43,8 @@ import java.util.UUID;
 @Service
 @Slf4j
 public class MrFirstAutomationService {
-    private static final Duration INITIAL_LOCK_RETRY_DELAY = Duration.ofSeconds(5);
-    private static final Duration MAX_LOCK_RETRY_DELAY = Duration.ofMinutes(1);
+    private static final Duration INITIAL_RETRY_DELAY = Duration.ofSeconds(5);
+    private static final Duration MAX_RETRY_DELAY = Duration.ofMinutes(1);
 
     private final TaskMapper tasks;
     private final WorkspaceRepositoryMapper worktrees;
@@ -56,8 +57,8 @@ public class MrFirstAutomationService {
     private final MrPreflightService preflightService;
     /** 防止事件监听器与恢复调度器在同一进程内同时刷新同一个 Git Store。 */
     private final Map<String, Boolean> preflightInFlight = new ConcurrentHashMap<>();
-    /** Git Store 锁竞争时的短暂退避，避免失败请求形成重试风暴。 */
-    private final Map<String, LockRetryState> lockRetryStates = new ConcurrentHashMap<>();
+    /** 外部预检失败时的短暂退避，避免 Worker/GitHub 故障形成重试风暴。 */
+    private final Map<String, RetryState> preflightRetryStates = new ConcurrentHashMap<>();
 
     public MrFirstAutomationService(TaskMapper tasks, WorkspaceRepositoryMapper worktrees,
                                     ProjectRepositoryMapper repositories, DryRunMapper dryRuns,
@@ -136,8 +137,8 @@ public class MrFirstAutomationService {
         List<WorkspaceRepositoryEntity> values = worktrees.selectByWorkspace(task.getWorkspaceId());
         for (WorkspaceRepositoryEntity worktree : values) {
             String repositoryKey = repositoryKey(projectId, worktree);
-            if (isInLockRetry(repositoryKey)) {
-                log.debug("preflight request deferred during Git Store lock backoff projectId={} taskId={} repositoryId={}",
+            if (isInRetry(repositoryKey)) {
+                log.debug("preflight request deferred during retry backoff projectId={} taskId={} repositoryId={}",
                         projectId, taskId, worktree.getProjectRepositoryId());
                 continue;
             }
@@ -149,16 +150,28 @@ public class MrFirstAutomationService {
             try {
                 preflightService.requestPreflight(projectId, task.getCreatedBy(), taskId,
                         worktree.getProjectRepositoryId(), null);
-                lockRetryStates.remove(repositoryKey);
+                preflightRetryStates.remove(repositoryKey);
                 log.info("preflight requested projectId={} taskId={} repositoryId={}",
                         projectId, taskId, worktree.getProjectRepositoryId());
             } catch (RuntimeException failure) {
-                // 预检申请失败（如分支被锁定）不应把已交付的 Task 标成开发失败；恢复调度器稍后重试。
-                if (isGitRepositoryLockFailure(failure)) {
-                    scheduleLockRetry(repositoryKey);
+                if (isNoChangesFailure(failure)) {
+                    log.warn("preflight stopped because source and target have no changes "
+                                    + "projectId={} taskId={} repositoryId={}",
+                            projectId, taskId, worktree.getProjectRepositoryId());
+                    // 无差异只说明当前仓库没有可创建的 MR，不能把整个多仓库任务
+                    // 收敛为 FAILED，也不能阻止其它仓库继续申请预检。
+                    continue;
                 }
-                log.warn("preflight request failed projectId={} taskId={} repositoryId={}: {}",
-                        projectId, taskId, worktree.getProjectRepositoryId(), failure.getMessage());
+                // 外部基础设施失败暂不改变 Task，但要退避后再重试，避免每轮调度重复打 Worker。
+                scheduleRetry(repositoryKey);
+                String failureCode = failure instanceof ApiException api ? api.code() : failure.getClass().getSimpleName();
+                String failureStatus = failure instanceof ApiException api && api.status() != null
+                        ? api.status().toString() : "";
+                log.warn("preflight request failed projectId={} taskId={} repositoryId={} exceptionType={} "
+                                + "failureCode={} status={} message={}",
+                        projectId, taskId, worktree.getProjectRepositoryId(), failure.getClass().getName(),
+                        failureCode, failureStatus,
+                        ExecutionContentSanitizer.sanitizeDiagnosticDetail(failure.getMessage()));
             } finally {
                 preflightInFlight.remove(repositoryKey);
             }
@@ -170,36 +183,35 @@ public class MrFirstAutomationService {
                 + (worktree.getSourceBranch() == null ? "" : worktree.getSourceBranch());
     }
 
-    private boolean isInLockRetry(String repositoryKey) {
-        LockRetryState state = lockRetryStates.get(repositoryKey);
+    private boolean isInRetry(String repositoryKey) {
+        RetryState state = preflightRetryStates.get(repositoryKey);
         return state != null && Instant.now().isBefore(state.nextAttemptAt());
     }
 
-    private void scheduleLockRetry(String repositoryKey) {
-        lockRetryStates.compute(repositoryKey, (key, previous) -> {
+    private void scheduleRetry(String repositoryKey) {
+        preflightRetryStates.compute(repositoryKey, (key, previous) -> {
             int failures = previous == null ? 1 : previous.failures() + 1;
-            long delaySeconds = Math.min(MAX_LOCK_RETRY_DELAY.toSeconds(),
-                    INITIAL_LOCK_RETRY_DELAY.toSeconds() << Math.min(failures - 1, 10));
-            return new LockRetryState(failures, Instant.now().plusSeconds(delaySeconds));
+            long delaySeconds = Math.min(MAX_RETRY_DELAY.toSeconds(),
+                    INITIAL_RETRY_DELAY.toSeconds() << Math.min(failures - 1, 10));
+            return new RetryState(failures, Instant.now().plusSeconds(delaySeconds));
         });
     }
 
-    private boolean isGitRepositoryLockFailure(Throwable failure) {
+    private boolean isNoChangesFailure(Throwable failure) {
         for (Throwable current = failure; current != null; current = current.getCause()) {
             if (current instanceof ApiException apiException
-                    && "GIT_REPOSITORY_LOCK_FAILED".equals(apiException.code())) {
+                    && "MR_NO_CHANGES".equals(apiException.code())) {
                 return true;
             }
             String message = current.getMessage();
-            if (message != null && (message.contains("GIT_REPOSITORY_LOCK_FAILED")
-                    || message.toLowerCase(java.util.Locale.ROOT).contains("cannot lock shared git repository"))) {
+            if (message != null && message.contains("MR_NO_CHANGES")) {
                 return true;
             }
         }
         return false;
     }
 
-    private record LockRetryState(int failures, Instant nextAttemptAt) {
+    private record RetryState(int failures, Instant nextAttemptAt) {
     }
 
     private void createMergeRequest(UUID projectId, UUID dryRunId) {
@@ -212,19 +224,22 @@ public class MrFirstAutomationService {
                 || !isPreflightActionable(task) || task.getCreatedBy() == null) {
             return;
         }
-        // 多仓库交付必须先确认所有仓库的当前 source/target、Dry Run 和独立 CQ+1，
-        // 任一仓库未完成时只保留预检状态，不提前创建局部 MR。
-        for (WorkspaceRepositoryEntity worktree : worktrees.selectByWorkspace(task.getWorkspaceId())) {
-            ProjectRepositoryEntity repository = repositories.selectById(worktree.getProjectRepositoryId());
-            String branch = worktree.getBaseRef();
-            if (branch == null || branch.isBlank()) branch = repository == null ? null : repository.getDefaultBranch();
-            if (branch == null || branch.isBlank()) return;
-            try {
-                if (!"PASSED".equals(preflightGates.get(projectId, task.getId(), worktree.getProjectRepositoryId(),
-                        branch, task.getCreatedBy()).getStatus())) return;
-            } catch (RuntimeException ignored) {
-                return;
-            }
+        // 预检是按仓库独立完成的：当前 Dry Run 对应仓库通过 Dry Run/CQ+1 后即可创建
+        // 自己的 MR。其它仓库失败或仍在等待 CQ+1 不应阻塞这个仓库，否则多仓库任务会
+        // 因一个仓库的外部故障把所有 MR 永久卡在 PENDING_CREATE。
+        WorkspaceRepositoryEntity worktree = worktrees.selectByWorkspace(task.getWorkspaceId()).stream()
+                .filter(value -> dryRun.getProjectRepositoryId().equals(value.getProjectRepositoryId()))
+                .findFirst().orElse(null);
+        if (worktree == null) return;
+        ProjectRepositoryEntity repository = repositories.selectById(worktree.getProjectRepositoryId());
+        String branch = worktree.getBaseRef();
+        if (branch == null || branch.isBlank()) branch = repository == null ? null : repository.getDefaultBranch();
+        if (branch == null || branch.isBlank()) return;
+        try {
+            if (!"PASSED".equals(preflightGates.get(projectId, task.getId(), worktree.getProjectRepositoryId(),
+                    branch, task.getCreatedBy()).getStatus())) return;
+        } catch (RuntimeException ignored) {
+            return;
         }
         MergeRequestCreateRequest request = new MergeRequestCreateRequest();
         request.setTaskId(task.getId());

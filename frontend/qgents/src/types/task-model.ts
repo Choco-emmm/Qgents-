@@ -130,6 +130,8 @@ export interface TaskCreateInput {
 export interface TaskListFilters {
   groupId?: string
   status?: TaskStatus
+  /** 排除指定状态（逗号分隔多值），服务端 not in 过滤——任务中心「隐藏已完成任务」传 SUCCEEDED。 */
+  excludeStatus?: TaskStatus
   createdBy?: string
   repositoryId?: string
   keyword?: string
@@ -339,6 +341,8 @@ export interface DiffListItem {
   repositoryId: string
   baseCommit: string
   sourceBranch: string
+  /** 目标分支；旧 Diff 响应可能缺省。 */
+  targetBranch?: string | null
   headCommit?: string | null
   status: DiffStatus
   changeStats: DiffChangeStats
@@ -465,6 +469,7 @@ export interface MergeRequestCreateInput {
   repositoryId: string
   targetBranch: string
   title: string
+  idempotencyKey?: string
 }
 
 /** POST /merge-requests/{id}/cq-approvals 与 cq-rejections */
@@ -496,6 +501,9 @@ export interface MergeRequestSummary {
   status: MergeRequestStatus
   /** 合并操作状态；异步合并受理后为 RUNNING，完成后为 COMPLETED/FAILED。 */
   mergeOperationStatus?: 'RUNNING' | 'COMPLETED' | 'FAILED' | null
+  /** 异步合并失败时由后端保存的受控错误信息。 */
+  mergeOperationFailureCode?: string | null
+  mergeOperationFailureReason?: string | null
   headCommit: string | null
   webUrl?: string | null
   taskId?: string | null
@@ -609,6 +617,10 @@ export type PreflightFailureCode =
 
 /** 单个仓库的预检状态摘要 */
 export interface PreflightRepositoryStatus {
+  /** 分支级预检申请 ID，用于失败后创建新的 Dry Run。 */
+  preflightId: string | null
+  /** 服务端推导的分支级预检状态。 */
+  status?: PreflightStatus
   repositoryId: string
   repositoryName: string
   sourceBranch: string

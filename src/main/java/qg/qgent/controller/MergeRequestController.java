@@ -128,6 +128,19 @@ public class MergeRequestController {
         return ok(data, request);
     }
 
+    /**
+     * 查询 GitHub Pull Request 的真实提交记录；默认返回最近 3 条，最多 100 条。
+     */
+    @GetMapping("/{mergeRequestId}/commits")
+    public ApiResponse<MergeRequestCommitListResponse> commits(@PathVariable UUID projectId,
+                                                                @PathVariable UUID mergeRequestId,
+                                                                @AuthenticationPrincipal UUID userId,
+                                                                @RequestParam(defaultValue = "3") int limit,
+                                                                HttpServletRequest request) {
+        return ApiResponse.ok(mergeRequestService.commits(projectId, mergeRequestId, userId, limit),
+                requestId(request));
+    }
+
     /** 查询 Qgents 创建的 MR 普通评论。行级评论仍通过 Diff 评论接口查询。 */
     @GetMapping("/{mergeRequestId}/comments")
     public ApiResponse<?> comments(@PathVariable UUID projectId, @PathVariable UUID mergeRequestId,
@@ -185,8 +198,11 @@ public class MergeRequestController {
     @PostMapping("/{mergeRequestId}/merge")
     @ResponseStatus(HttpStatus.ACCEPTED)
     public ApiResponse<?> merge(@PathVariable UUID projectId, @PathVariable UUID mergeRequestId,
-                                @AuthenticationPrincipal UUID userId, HttpServletRequest request) {
-        MergeRequestSummaryResponse data = mergeRequestService.merge(projectId, mergeRequestId, userId);
+                                @AuthenticationPrincipal UUID userId,
+                                @RequestBody(required = false) MergeRequestMergeRequest body,
+                                HttpServletRequest request) {
+        MergeRequestSummaryResponse data = mergeRequestService.merge(projectId, mergeRequestId, userId,
+                body == null ? null : body.getCommitMessage());
         return ok(data, request);
     }
 

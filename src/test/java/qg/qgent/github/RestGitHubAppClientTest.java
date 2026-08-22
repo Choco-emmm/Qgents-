@@ -2,6 +2,7 @@ package qg.qgent.github;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.springframework.test.web.client.ExpectedCount.once;
 import static org.springframework.test.web.client.match.MockRestRequestMatchers.header;
 import static org.springframework.test.web.client.match.MockRestRequestMatchers.method;
@@ -195,6 +196,31 @@ class RestGitHubAppClientTest {
     }
 
     @Test
+    void getsPullRequestCommitsWithRealTotalCount() {
+        server.expect(once(), requestTo("https://api.github.com/repos/owner/repo/pulls/42"))
+                .andExpect(method(HttpMethod.GET))
+                .andRespond(withSuccess("""
+                        {"id":1,"number":42,"commits":5}
+                        """, MediaType.APPLICATION_JSON));
+        server.expect(once(), requestTo("https://api.github.com/repos/owner/repo/pulls/42/commits?per_page=3"))
+                .andExpect(method(HttpMethod.GET))
+                .andRespond(withSuccess("""
+                        [{"sha":"abc123","commit":{"message":"实现提交记录\\n\\n更多说明",
+                        "author":{"name":"Alice","date":"2026-08-22T00:00:00Z"}},
+                        "author":{"id":123,"login":"alice"}}]
+                        """, MediaType.APPLICATION_JSON));
+
+        GitHubPullRequestCommitList commits = client.getPullRequestCommits(12345L, "owner", "repo", 42, 3);
+
+        assertEquals(5, commits.totalCount());
+        assertEquals(1, commits.items().size());
+        assertEquals("abc123", commits.items().getFirst().sha());
+        assertEquals("Alice", commits.items().getFirst().authorName());
+        assertEquals(null, commits.items().getFirst().authorUserId());
+        server.verify();
+    }
+
+    @Test
     void createsPullRequestIssueComment() {
         server.expect(once(), requestTo("https://api.github.com/repos/owner/repo/issues/42/comments"))
                 .andExpect(method(HttpMethod.POST))
@@ -217,16 +243,36 @@ class RestGitHubAppClientTest {
     void returnsGitHubMergeOutcomeInsteadOfAssumingSuccess() {
         server.expect(once(), requestTo("https://api.github.com/repos/owner/repo/pulls/42/merge"))
                 .andExpect(method(HttpMethod.PUT))
+                .andExpect(content().json("{\"commit_title\":\"Merge login\",\"merge_method\":\"squash\",\"sha\":\"head-sha\"}"))
                 .andRespond(withSuccess("""
                         {"sha":"merge-sha","merged":false,"message":"Pull Request is not mergeable"}
                         """, MediaType.APPLICATION_JSON));
 
         GitHubPullRequestMergeResult result = client.mergePullRequest(12345L, "owner", "repo", 42,
-                new GitHubPullRequestMergeRequest("Merge login", "", "squash", "head-sha"));
+                new GitHubPullRequestMergeRequest("Merge login", null, "squash", "head-sha"));
 
         assertFalse(result.merged());
         assertEquals("Pull Request is not mergeable", result.message());
         server.verify();
+    }
+
+    @Test
+    void preservesRejectedGitHubMergeReason() {
+        server.expect(once(), requestTo("https://api.github.com/repos/owner/repo/pulls/42/merge"))
+                .andExpect(method(HttpMethod.PUT))
+                .andRespond(withStatus(HttpStatus.FORBIDDEN)
+                        .body("{\"message\":\"Resource not accessible by integration\"}"));
+
+        try {
+            client.mergePullRequest(12345L, "owner", "repo", 42,
+                    new GitHubPullRequestMergeRequest("Merge login", "", "squash", "head-sha"));
+        } catch (qg.qgent.api.ApiException exception) {
+            assertEquals("GITHUB_MERGE_REJECTED", exception.code());
+            assertTrue(exception.getMessage().contains("Resource not accessible by integration"));
+            server.verify();
+            return;
+        }
+        throw new AssertionError("Expected GitHub merge failure");
     }
 
     @Test

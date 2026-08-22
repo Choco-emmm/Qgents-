@@ -11,12 +11,17 @@ import org.springframework.web.client.RestClientResponseException;
 import qg.qgent.api.ApiException;
 import qg.qgent.config.PerformanceMetrics;
 import qg.qgent.orchestration.ExecutionContentSanitizer;
+import qg.qgent.orchestration.tool.Sha256;
 
 import java.net.ConnectException;
 import java.net.NoRouteToHostException;
 import java.net.SocketTimeoutException;
 import java.net.UnknownHostException;
+import java.nio.charset.StandardCharsets;
+import java.time.Duration;
+import java.util.List;
 import java.util.UUID;
+import java.util.function.Function;
 import java.util.function.Supplier;
 
 /**
@@ -56,15 +61,28 @@ public class SandboxWorkerClient {
     private final RestClient client;
     private final ObjectMapper objectMapper;
     private final PerformanceMetrics metrics;
+    /**
+     * Testset 接口是同步长连接；其读取超时必须覆盖本次已冻结的测试预算，不能复用普通
+     * Worker API 的短请求超时。
+     */
+    private final Function<Duration, RestClient> testExecutionClientFactory;
+
+    private static final Duration TEST_EXECUTION_TRANSPORT_MARGIN = Duration.ofMinutes(10);
 
     public SandboxWorkerClient(RestClient client, ObjectMapper objectMapper) {
         this(client, objectMapper, null);
     }
 
     public SandboxWorkerClient(RestClient client, ObjectMapper objectMapper, PerformanceMetrics metrics) {
+        this(client, objectMapper, metrics, null);
+    }
+
+    SandboxWorkerClient(RestClient client, ObjectMapper objectMapper, PerformanceMetrics metrics,
+                        Function<Duration, RestClient> testExecutionClientFactory) {
         this.client = client;
         this.objectMapper = objectMapper;
         this.metrics = metrics;
+        this.testExecutionClientFactory = testExecutionClientFactory;
     }
 
     /**
@@ -280,8 +298,27 @@ public class SandboxWorkerClient {
      * 同步执行已由主后端校验的 Testset 定义。
      */
     public WorkerTestExecutionResponse executeTests(WorkerTestExecutionRequest request) {
-        return execute(() -> client.post().uri(TEST_EXECUTIONS).body(request).retrieve()
+        RestClient testClient = testExecutionClientFactory == null
+                ? client
+                : testExecutionClientFactory.apply(testExecutionTimeout(request));
+        return execute(() -> testClient.post().uri(TEST_EXECUTIONS).body(request).retrieve()
                 .body(WorkerTestExecutionResponse.class));
+    }
+
+    /**
+     * Worker 会串行运行本次 Testset。主后端因此要等待所有单项预算，而不是在默认 30 秒
+     * 响应超时后把仍在正常执行的 Maven/Gradle 误判为 Worker 不可用。
+     */
+    static Duration testExecutionTimeout(WorkerTestExecutionRequest request) {
+        List<WorkerTestExecutionItemRequest> testsets = request == null || request.getTestsets() == null
+                ? List.of() : request.getTestsets();
+        long seconds = testsets.stream()
+                .map(WorkerTestExecutionItemRequest::getTimeoutSeconds)
+                .filter(java.util.Objects::nonNull)
+                .mapToLong(Integer::longValue)
+                .filter(value -> value > 0)
+                .sum();
+        return Duration.ofSeconds(Math.max(1L, seconds)).plus(TEST_EXECUTION_TRANSPORT_MARGIN);
     }
 
     /**
@@ -336,8 +373,9 @@ public class SandboxWorkerClient {
     private ApiException workerError(RestClientResponseException exception) {
         String code = "SANDBOX_WORKER_ERROR";
         String message = "Sandbox Worker 返回了无法处理的错误响应";
+        String body = null;
         try {
-            String body = exception.getResponseBodyAsString();
+            body = exception.getResponseBodyAsString();
             if (body != null && !body.isBlank()) {
                 WorkerErrorResponse error = objectMapper.readValue(body, WorkerErrorResponse.class);
                 if (error != null) {
@@ -352,9 +390,16 @@ public class SandboxWorkerClient {
         } catch (Exception ignored) {
             // 错误体非预期结构时退回通用错误码与安全消息。
         }
+        log.warn("sandbox worker returned non-2xx status={} statusText={} responseBytes={} responseSha256={} code={}",
+                exception.getStatusCode().value(), exception.getStatusText(), utf8Bytes(body),
+                Sha256.hex((body == null ? "" : body).getBytes(StandardCharsets.UTF_8)), code);
         HttpStatus status = HttpStatus.resolve(exception.getStatusCode().value());
         return new ApiException(status == null ? HttpStatus.BAD_GATEWAY : status, code,
                 safeDiagnosticMessage(message));
+    }
+
+    private static int utf8Bytes(String value) {
+        return value == null ? 0 : value.getBytes(StandardCharsets.UTF_8).length;
     }
 
     static SandboxWorkerTransportException transportFailure(RestClientException exception) {

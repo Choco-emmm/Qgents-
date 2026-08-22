@@ -1,6 +1,6 @@
 import { useMutation, useQuery, type UseMutationResult, type UseQueryResult } from '@tanstack/react-query'
 import { branchPolicyApi, dryRunCqApi, preflightApi, qualityGateApi } from '@/api/qualityGate'
-import { queryClient, queryKeys } from '@/query'
+import { queryClient, queryKeys, taskModelQueryKeys } from '@/query'
 import type {
   BranchPolicy,
   BranchPolicyUpdateInput,
@@ -92,6 +92,8 @@ export function usePreflight(
     queryKey: queryKeys.preflight.detail(projectId, taskId, repositoryId, targetBranch),
     queryFn: () => preflightApi.get(projectId, taskId, repositoryId, targetBranch),
     enabled: Boolean(projectId && targetBranch),
+    // 返回列表页时先复用刚刚查看过的快照；轮询和 SSE 仍会在短时间内校正状态。
+    staleTime: 5_000,
     // 任务交付阶段（DELIVERING → WAITING_PREFLIGHT）需要自动刷新，
     // 以便后端完成 commit/push 后前端能及时看到 Dry Run 状态变化。
     refetchInterval: pollingInterval,
@@ -107,6 +109,9 @@ export function useApproveDryRunCq(projectId: string): UseMutationResult<DryRunC
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: queryKeys.dryRuns.all(projectId) })
       void queryClient.invalidateQueries({ queryKey: queryKeys.preflight.all(projectId) })
+      // The real MR is created asynchronously after CQ+1. Refresh its list
+      // so the old placeholder cannot keep exposing a WAITING_CQ action.
+      void queryClient.invalidateQueries({ queryKey: taskModelQueryKeys.mergeRequests.all(projectId) })
     },
   })
 }
@@ -118,6 +123,7 @@ export function useRejectDryRunCq(projectId: string): UseMutationResult<DryRunCq
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: queryKeys.dryRuns.all(projectId) })
       void queryClient.invalidateQueries({ queryKey: queryKeys.preflight.all(projectId) })
+      void queryClient.invalidateQueries({ queryKey: taskModelQueryKeys.mergeRequests.all(projectId) })
     },
   })
 }

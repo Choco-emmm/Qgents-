@@ -199,6 +199,8 @@ export function CreateProjectModal({
             navigate(PATHS.projectDetail(project.id), { replace: true })
           } catch (err) {
             // 保持弹窗打开，展示提交失败原因（§49.7 稳定错误码 → 中文文案），用户可修正后重试
+            // 建仓失败可能是 OAuth 刚被撤销/重新绑定，立即刷新状态，避免继续使用旧授权状态提交。
+            void queryClient.invalidateQueries({ queryKey: queryKeys.githubOAuth })
             setSubmitError(newRepositoryCreateErrorMessage(err) ?? formatApiError(err))
           }
         }}
@@ -325,10 +327,16 @@ export function CreateProjectModal({
                 <Empty
                   image={Empty.PRESENTED_IMAGE_SIMPLE}
                   description={
-                    <span>
-                      暂无已授权的 GitHub 仓库，请先
-                      <TextLink onClick={() => { onClose(); navigate(PATHS.githubIntegration(teamId)) }}>去授权</TextLink>
-                    </span>
+                    activeInstallations.length === 0 ? (
+                      <span>
+                        暂无已授权的 GitHub 仓库，请先
+                        <TextLink onClick={() => { onClose(); navigate(PATHS.githubIntegration(teamId)) }}>去授权</TextLink>
+                      </span>
+                    ) : (
+                      <span>
+                        团队 GitHub App 已授权，但当前没有可绑定的仓库。请先在 GitHub 创建仓库，或到 GitHub App 安装设置中为你的账号授权仓库范围。
+                      </span>
+                    )
                   }
                 />
               ) : undefined

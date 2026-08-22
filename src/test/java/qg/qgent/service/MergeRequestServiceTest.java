@@ -1257,6 +1257,63 @@ class MergeRequestServiceTest {
     }
 
     @Test
+    void syncDoesNotPublishWhenVisibleRemoteStateIsUnchanged() {
+        UUID projectId = UUID.randomUUID();
+        UUID userId = UUID.randomUUID();
+        UUID mergeRequestId = UUID.randomUUID();
+        UUID repositoryId = UUID.randomUUID();
+        MergeRequestEntity mr = new MergeRequestEntity();
+        mr.setId(mergeRequestId);
+        mr.setProjectRepositoryId(repositoryId);
+        mr.setStatus("OPEN");
+        mr.setProviderNumber(100L);
+        mr.setSourceBranch("feature/test");
+        mr.setTargetBranch("main");
+        mr.setHeadCommit("sha123");
+        mr.setTitle("Test PR");
+        mr.setMergeable(true);
+        mr.setMergeableState("clean");
+        mr.setBaseSha("base-sha");
+        mr.setQualityGateStatus("PASSED");
+        when(mergeRequestMapper.selectById(mergeRequestId)).thenReturn(mr);
+        ProjectRepositoryEntity repository = new ProjectRepositoryEntity();
+        repository.setId(repositoryId);
+        repository.setProjectId(projectId);
+        repository.setRepositoryId(UUID.randomUUID());
+        when(projectRepositoryMapper.selectById(repositoryId)).thenReturn(repository);
+        GitHubRepositoryEntity githubRepository = new GitHubRepositoryEntity();
+        githubRepository.setId(repository.getRepositoryId());
+        githubRepository.setInstallationId(UUID.randomUUID());
+        githubRepository.setOwnerLogin("owner");
+        githubRepository.setName("repo");
+        githubRepository.setAuthorizationStatus("AUTHORIZED");
+        githubRepository.setArchived(false);
+        when(githubRepositoryMapper.selectById(repository.getRepositoryId())).thenReturn(githubRepository);
+        ProjectEntity project = new ProjectEntity();
+        project.setId(projectId);
+        project.setTeamId(UUID.randomUUID());
+        when(projectMapper.selectById(projectId)).thenReturn(project);
+        GitHubInstallationEntity installation = new GitHubInstallationEntity();
+        installation.setId(githubRepository.getInstallationId());
+        installation.setStatus("ACTIVE");
+        installation.setProviderInstallationId(12345L);
+        installation.setTeamId(project.getTeamId());
+        when(githubInstallationMapper.selectById(githubRepository.getInstallationId())).thenReturn(installation);
+        when(githubClient.getPullRequest(12345L, "owner", "repo", 100)).thenReturn(
+                new GitHubPullRequestDetails(1L, 100, "open", "Test PR", "sha123", "feature/test", "main",
+                        false, "url", true, "clean", "base-sha"));
+        when(branchConfigMapper.selectList(any())).thenReturn(java.util.List.of());
+        when(qualityCheckMapper.selectList(any())).thenReturn(java.util.List.of());
+        when(mergeRequestGroupMapper.selectByMergeRequestIds(any())).thenReturn(java.util.List.of());
+
+        service.sync(projectId, mergeRequestId, userId);
+
+        verify(mergeRequestMapper, never()).updateById(mr);
+        verify(eventService, never()).publish(any(), any(), eq("merge-request.updated"), any(), any());
+        verifyNoInteractions(notificationService);
+    }
+
+    @Test
     void createFailsWhenInstallationNotActive() {
         UUID projectId = UUID.randomUUID();
         UUID userId = UUID.randomUUID();
@@ -1607,6 +1664,8 @@ class MergeRequestServiceTest {
         task.setDeliveryMode("MR_FIRST");
         task.setTitle("待创建 MR");
         when(taskMapper.selectList(any())).thenReturn(java.util.List.of(task));
+        when(diffs.selectList(any())).thenReturn(java.util.List.of(
+                deliveredDiff(taskId, repositoryId, "feat/task-pending")));
         when(mergeRequestMapper.selectList(any())).thenReturn(java.util.List.of());
 
         var response = service.list(projectId, userId, null, null, null, null, 20, "req-1");
@@ -1657,6 +1716,8 @@ class MergeRequestServiceTest {
         task.setDeliveryMode("DIFF_FIRST");
         task.setTitle("小任务");
         when(taskMapper.selectList(any())).thenReturn(java.util.List.of(task));
+        when(diffs.selectList(any())).thenReturn(java.util.List.of(
+                deliveredDiff(taskId, repositoryId, "feat/task-diff-first")));
         when(mergeRequestMapper.selectList(any())).thenReturn(java.util.List.of());
 
         var response = service.list(projectId, userId, null, null, null, null, 20, "req-1");
@@ -1668,6 +1729,203 @@ class MergeRequestServiceTest {
         assertEquals("MANUAL", row.getCreateMode());
         assertEquals("feat/task-diff-first", row.getSourceBranch());
         assertEquals("main", row.getTargetBranch());
+    }
+
+    @Test
+    void listUsesDiffRepositoryScopeWhenOneTaskHasMultipleWorkspaceRepositories() {
+        UUID projectId = UUID.randomUUID();
+        UUID userId = UUID.randomUUID();
+        UUID workspaceId = UUID.randomUUID();
+        UUID backendRepositoryId = UUID.randomUUID();
+        UUID frontendRepositoryId = UUID.randomUUID();
+        UUID taskId = UUID.randomUUID();
+
+        ProjectRepositoryEntity backend = new ProjectRepositoryEntity();
+        backend.setId(backendRepositoryId);
+        backend.setProjectId(projectId);
+        backend.setDefaultBranch("main");
+        ProjectRepositoryEntity frontend = new ProjectRepositoryEntity();
+        frontend.setId(frontendRepositoryId);
+        frontend.setProjectId(projectId);
+        frontend.setDefaultBranch("main");
+        when(projectRepositoryMapper.selectList(any())).thenReturn(java.util.List.of(backend, frontend));
+        when(projectRepositoryMapper.selectBatchIds(anyCollection())).thenReturn(java.util.List.of(backend, frontend));
+
+        WorkspaceRepositoryEntity backendWorktree = new WorkspaceRepositoryEntity();
+        backendWorktree.setWorkspaceId(workspaceId);
+        backendWorktree.setProjectRepositoryId(backendRepositoryId);
+        backendWorktree.setBaseRef("main");
+        backendWorktree.setSourceBranch("feat/multi-repo");
+        backendWorktree.setBaseCommit("backend-base");
+        backendWorktree.setHeadCommit("backend-head");
+        WorkspaceRepositoryEntity frontendWorktree = new WorkspaceRepositoryEntity();
+        frontendWorktree.setWorkspaceId(workspaceId);
+        frontendWorktree.setProjectRepositoryId(frontendRepositoryId);
+        frontendWorktree.setBaseRef("main");
+        frontendWorktree.setSourceBranch("feat/multi-repo");
+        frontendWorktree.setBaseCommit("frontend-base");
+        frontendWorktree.setHeadCommit("frontend-head");
+        when(workspaceRepositoryMapper.selectByProject(projectId, null))
+                .thenReturn(java.util.List.of(backendWorktree, frontendWorktree));
+
+        TaskEntity task = new TaskEntity();
+        task.setId(taskId);
+        task.setProjectId(projectId);
+        task.setWorkspaceId(workspaceId);
+        task.setStatus("SUCCEEDED");
+        task.setDeliveryMode("DIFF_FIRST");
+        when(taskMapper.selectList(any())).thenReturn(java.util.List.of(task));
+        when(diffs.selectList(any())).thenReturn(java.util.List.of(
+                deliveredDiff(taskId, backendRepositoryId, "feat/multi-repo")));
+        when(mergeRequestMapper.selectList(any())).thenReturn(java.util.List.of());
+
+        var response = service.list(projectId, userId, null, null, null, null, 20, "req-multi-repo");
+
+        assertEquals(1, response.data().size());
+        assertEquals(backendRepositoryId.toString(), response.data().get(0).getRepositoryId());
+    }
+
+    @Test
+    void listKeepsOlderTaskCandidateForRepositoryUntouchedByNewestTask() {
+        UUID projectId = UUID.randomUUID();
+        UUID userId = UUID.randomUUID();
+        UUID workspaceId = UUID.randomUUID();
+        UUID backendRepositoryId = UUID.randomUUID();
+        UUID frontendRepositoryId = UUID.randomUUID();
+        UUID olderTaskId = UUID.randomUUID();
+        UUID newerTaskId = UUID.randomUUID();
+
+        ProjectRepositoryEntity backend = new ProjectRepositoryEntity();
+        backend.setId(backendRepositoryId);
+        backend.setProjectId(projectId);
+        backend.setDefaultBranch("main");
+        ProjectRepositoryEntity frontend = new ProjectRepositoryEntity();
+        frontend.setId(frontendRepositoryId);
+        frontend.setProjectId(projectId);
+        frontend.setDefaultBranch("main");
+        when(projectRepositoryMapper.selectList(any())).thenReturn(java.util.List.of(backend, frontend));
+        when(projectRepositoryMapper.selectBatchIds(anyCollection())).thenReturn(java.util.List.of(backend, frontend));
+
+        WorkspaceRepositoryEntity backendWorktree = new WorkspaceRepositoryEntity();
+        backendWorktree.setWorkspaceId(workspaceId);
+        backendWorktree.setProjectRepositoryId(backendRepositoryId);
+        backendWorktree.setBaseRef("main");
+        backendWorktree.setSourceBranch("feat/continued");
+        backendWorktree.setBaseCommit("backend-base");
+        backendWorktree.setHeadCommit("backend-head");
+        WorkspaceRepositoryEntity frontendWorktree = new WorkspaceRepositoryEntity();
+        frontendWorktree.setWorkspaceId(workspaceId);
+        frontendWorktree.setProjectRepositoryId(frontendRepositoryId);
+        frontendWorktree.setBaseRef("main");
+        frontendWorktree.setSourceBranch("feat/continued");
+        frontendWorktree.setBaseCommit("frontend-base");
+        frontendWorktree.setHeadCommit("frontend-head");
+        when(workspaceRepositoryMapper.selectByProject(projectId, null))
+                .thenReturn(java.util.List.of(backendWorktree, frontendWorktree));
+
+        TaskEntity olderTask = new TaskEntity();
+        olderTask.setId(olderTaskId);
+        olderTask.setProjectId(projectId);
+        olderTask.setWorkspaceId(workspaceId);
+        olderTask.setStatus("SUCCEEDED");
+        olderTask.setDeliveryMode("DIFF_FIRST");
+        olderTask.setUpdatedAt(LocalDateTime.of(2026, 8, 22, 1, 0));
+        TaskEntity newerTask = new TaskEntity();
+        newerTask.setId(newerTaskId);
+        newerTask.setProjectId(projectId);
+        newerTask.setWorkspaceId(workspaceId);
+        newerTask.setStatus("SUCCEEDED");
+        newerTask.setDeliveryMode("DIFF_FIRST");
+        newerTask.setUpdatedAt(LocalDateTime.of(2026, 8, 22, 2, 0));
+        when(taskMapper.selectList(any())).thenReturn(java.util.List.of(olderTask, newerTask));
+        when(diffs.selectList(any())).thenReturn(java.util.List.of(
+                deliveredDiff(olderTaskId, backendRepositoryId, "feat/continued"),
+                deliveredDiff(newerTaskId, frontendRepositoryId, "feat/continued")));
+        when(mergeRequestMapper.selectList(any())).thenReturn(java.util.List.of());
+
+        var response = service.list(projectId, userId, null, null, null, null, 20, "req-continued");
+
+        assertEquals(2, response.data().size());
+        assertTrue(response.data().stream().anyMatch(row -> backendRepositoryId.toString().equals(row.getRepositoryId())
+                && olderTaskId.toString().equals(row.getTaskId())));
+        assertTrue(response.data().stream().anyMatch(row -> frontendRepositoryId.toString().equals(row.getRepositoryId())
+                && newerTaskId.toString().equals(row.getTaskId())));
+    }
+
+    @Test
+    void listSkipsPlaceholderWhenWorkspaceHeadStillEqualsBaseCommit() {
+        UUID projectId = UUID.randomUUID();
+        UUID userId = UUID.randomUUID();
+        UUID repositoryId = UUID.randomUUID();
+        UUID workspaceId = UUID.randomUUID();
+        UUID taskId = UUID.randomUUID();
+
+        ProjectRepositoryEntity repository = new ProjectRepositoryEntity();
+        repository.setId(repositoryId);
+        repository.setProjectId(projectId);
+        repository.setDefaultBranch("main");
+        when(projectRepositoryMapper.selectList(any())).thenReturn(java.util.List.of(repository));
+        when(projectRepositoryMapper.selectBatchIds(anyCollection())).thenReturn(java.util.List.of(repository));
+
+        WorkspaceRepositoryEntity worktree = new WorkspaceRepositoryEntity();
+        worktree.setWorkspaceId(workspaceId);
+        worktree.setProjectRepositoryId(repositoryId);
+        worktree.setBaseRef("main");
+        worktree.setBaseCommit("same-sha");
+        worktree.setSourceBranch("feat/task-no-change");
+        worktree.setHeadCommit("same-sha");
+        when(workspaceRepositoryMapper.selectByProject(projectId, null)).thenReturn(java.util.List.of(worktree));
+
+        TaskEntity task = new TaskEntity();
+        task.setId(taskId);
+        task.setProjectId(projectId);
+        task.setWorkspaceId(workspaceId);
+        task.setStatus("WAITING_PREFLIGHT");
+        task.setDeliveryMode("MR_FIRST");
+        when(taskMapper.selectList(any())).thenReturn(java.util.List.of(task));
+        when(mergeRequestMapper.selectList(any())).thenReturn(java.util.List.of());
+
+        var response = service.list(projectId, userId, null, null, null, null, 20, "req-no-change");
+
+        assertTrue(response.data().isEmpty());
+    }
+
+    @Test
+    void listDoesNotInjectPendingPlaceholderForTaskAwaitingDeliveryConfirmation() {
+        UUID projectId = UUID.randomUUID();
+        UUID userId = UUID.randomUUID();
+        UUID repositoryId = UUID.randomUUID();
+        UUID workspaceId = UUID.randomUUID();
+        UUID taskId = UUID.randomUUID();
+
+        ProjectRepositoryEntity repository = new ProjectRepositoryEntity();
+        repository.setId(repositoryId);
+        repository.setProjectId(projectId);
+        repository.setDefaultBranch("main");
+        when(projectRepositoryMapper.selectList(any())).thenReturn(java.util.List.of(repository));
+        when(projectRepositoryMapper.selectBatchIds(anyCollection())).thenReturn(java.util.List.of(repository));
+
+        WorkspaceRepositoryEntity worktree = new WorkspaceRepositoryEntity();
+        worktree.setWorkspaceId(workspaceId);
+        worktree.setProjectRepositoryId(repositoryId);
+        worktree.setBaseRef("main");
+        worktree.setSourceBranch("feat/task-unconfirmed");
+        worktree.setHeadCommit("base-head");
+        when(workspaceRepositoryMapper.selectByProject(projectId, null)).thenReturn(java.util.List.of(worktree));
+
+        TaskEntity task = new TaskEntity();
+        task.setId(taskId);
+        task.setProjectId(projectId);
+        task.setWorkspaceId(workspaceId);
+        task.setStatus("WAITING_DIFF_CONFIRMATION");
+        task.setDeliveryMode("DIFF_FIRST");
+        task.setTitle("尚未确认交付");
+        when(taskMapper.selectList(any())).thenReturn(java.util.List.of(task));
+        when(mergeRequestMapper.selectList(any())).thenReturn(java.util.List.of());
+
+        var response = service.list(projectId, userId, null, null, "PENDING_CREATE", null, 20, "req-unconfirmed");
+
+        assertTrue(response.data().isEmpty());
     }
 
     @Test
@@ -1719,6 +1977,9 @@ class MergeRequestServiceTest {
         newerTask.setDeliveryMode("DIFF_FIRST");
         newerTask.setUpdatedAt(LocalDateTime.of(2026, 8, 20, 11, 0));
         when(taskMapper.selectList(any())).thenReturn(java.util.List.of(olderTask, newerTask));
+        when(diffs.selectList(any())).thenReturn(java.util.List.of(
+                deliveredDiff(olderTaskId, repositoryId, "feat/shared"),
+                deliveredDiff(newerTaskId, repositoryId, "feat/shared")));
         when(mergeRequestMapper.selectList(any())).thenReturn(java.util.List.of());
 
         var response = service.list(projectId, userId, null, null, null, null, 20, "req-1");
@@ -1728,6 +1989,17 @@ class MergeRequestServiceTest {
         assertEquals(newerTaskId.toString(), row.getTaskId());
         assertEquals("newer-head", row.getHeadCommit());
         assertEquals("feat/shared", row.getSourceBranch());
+    }
+
+    private DiffEntity deliveredDiff(UUID taskId, UUID repositoryId, String sourceBranch) {
+        DiffEntity diff = new DiffEntity();
+        diff.setId(UUID.randomUUID());
+        diff.setTaskId(taskId);
+        diff.setProjectRepositoryId(repositoryId);
+        diff.setSourceBranch(sourceBranch);
+        diff.setStatus("ACCEPTED");
+        diff.setDeliveryStatus("PUSHED");
+        return diff;
     }
 
     @Test

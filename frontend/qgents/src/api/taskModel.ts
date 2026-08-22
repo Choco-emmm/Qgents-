@@ -26,7 +26,6 @@ import type {
   MergeRequestCreateInput,
   MergeRequestCqInput,
   MergeRequestListFilters,
-  MergeRequestSummary,
   PageFilters,
   Task,
   TaskArtifact,
@@ -319,6 +318,17 @@ export const mergeRequestsApi = {
     }).then(mapPreflightResponse)
   },
 
+  /** 重新预检：让后端基于当前目标分支门禁配置创建新的 Dry Run。 */
+  retryPreflight(projectId: string, preflightId: string): Promise<MergeRequestPreflight> {
+    return requestModelData<unknown>(
+      `/projects/${projectId}/merge-requests/preflight/${preflightId}/retries`,
+      {
+        method: 'POST',
+        headers: writeModelHeaders(),
+      },
+    ).then(mapPreflightResponse)
+  },
+
   /** 查询单个预检状态 */
   getPreflight(projectId: string, preflightId: string): Promise<MergeRequestPreflight> {
     return requestModelData<unknown>(
@@ -327,16 +337,18 @@ export const mergeRequestsApi = {
   },
 
   /** 按 Task 查询全部仓库预检状态 */
-  getTaskPreflight(projectId: string, taskId: string): Promise<TaskMergeRequestPreflightList> {
+  getTaskPreflight(projectId: string, taskId: string, signal?: AbortSignal): Promise<TaskMergeRequestPreflightList> {
     return requestModelData<unknown>(
       `/projects/${projectId}/tasks/${taskId}/merge-request-preflight`,
+      { signal },
     ).then(mapTaskPreflightList)
   },
 
-  merge(projectId: string, mergeRequestId: string) {
+  merge(projectId: string, mergeRequestId: string, commitMessage?: string) {
     return requestModelData<unknown>(`/projects/${projectId}/merge-requests/${mergeRequestId}/merge`, {
       method: 'POST',
       headers: writeModelHeaders(),
+      body: commitMessage?.trim() ? { commitMessage: commitMessage.trim() } : undefined,
     }).then(mapMergeRequest)
   },
 

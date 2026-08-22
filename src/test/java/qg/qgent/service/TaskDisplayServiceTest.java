@@ -149,7 +149,7 @@ class TaskDisplayServiceTest {
         TaskStepEntity step = step(stepId, task.getId(), "RUNNING");
         when(steps.selectList(any())).thenReturn(List.of(step));
         TaskRunEntity run = run(projectId, task.getId(), stepId, runId, "WAITING_INPUT");
-        when(runs.selectList(any())).thenReturn(List.of(run));
+        when(runs.selectLatestForTaskList(any())).thenReturn(List.of(run));
         InputRequestEntity request = new InputRequestEntity();
         request.setId(UUID.randomUUID());
         request.setTaskRunId(runId);
@@ -171,7 +171,7 @@ class TaskDisplayServiceTest {
         when(groupService.visibleGroupIds(projectId, actor)).thenReturn(List.of(groupId));
 
         PagedApiResponse<TaskListItemResponse> page = service.list(projectId, actor, null, null, null, null, null, null,
-                null, "req");
+                null, null, "req");
 
         TaskListItemResponse item = page.data().getFirst();
         assertNull(page.page().getNextCursor());
@@ -194,7 +194,7 @@ class TaskDisplayServiceTest {
         TaskEntity task = task(projectId, groupId, creatorId, workspaceId, "WAITING_DIFF_CONFIRMATION");
         when(tasks.selectList(any())).thenReturn(List.of(task));
         when(steps.selectList(any())).thenReturn(List.of());
-        when(runs.selectList(any())).thenReturn(List.of());
+        when(runs.selectLatestForTaskList(any())).thenReturn(List.of());
         UserEntity creator = new UserEntity();
         creator.setId(creatorId);
         creator.setDisplayName("陈同学");
@@ -214,7 +214,7 @@ class TaskDisplayServiceTest {
         batch.setConfirmationSource("USER");
         when(diffBatches.selectList(any())).thenReturn(List.of(batch));
 
-        TaskListItemResponse item = service.list(projectId, actor, null, null, null, null, null, null, null, "req")
+        TaskListItemResponse item = service.list(projectId, actor, null, null, null, null, null, null, null, null, "req")
                 .data().getFirst();
 
         assertEquals("DIFF_CONFIRMATION_REQUIRED", item.getAttention().getKind());
@@ -227,7 +227,7 @@ class TaskDisplayServiceTest {
         TaskEntity task = task(projectId, groupId, actor, workspaceId, "DIFF_REJECTED");
         when(tasks.selectList(any())).thenReturn(List.of(task));
         when(steps.selectList(any())).thenReturn(List.of());
-        when(runs.selectList(any())).thenReturn(List.of());
+        when(runs.selectLatestForTaskList(any())).thenReturn(List.of());
         when(access.isOwnerOrAdmin(actor, projectId, actor)).thenReturn(true);
 
         DiffReviewBatchEntity batch = new DiffReviewBatchEntity();
@@ -238,7 +238,7 @@ class TaskDisplayServiceTest {
         when(diffBatches.selectList(any())).thenReturn(List.of(batch));
         when(groupService.visibleGroupIds(projectId, actor)).thenReturn(List.of(groupId));
 
-        TaskListItemResponse item = service.list(projectId, actor, null, null, null, null, null, null, null, "req")
+        TaskListItemResponse item = service.list(projectId, actor, null, null, null, null, null, null, null, null, "req")
                 .data().getFirst();
 
         assertEquals("DIFF_REJECTED", item.getAttention().getKind());
@@ -346,6 +346,7 @@ class TaskDisplayServiceTest {
         TaskRunEntity failed = run(projectId, task.getId(), stepId, runId, "FAILED");
         failed.setFailureCode("FILE_PATCH_FAILED");
         failed.setFailureReason("补丁无法应用，请重新读取文件后重试");
+        when(runs.selectLatestForTaskList(any())).thenReturn(List.of(failed));
         when(runs.selectList(any())).thenReturn(List.of(failed));
         when(access.isOwnerOrAdmin(actor, projectId, actor)).thenReturn(true);
 
@@ -360,7 +361,7 @@ class TaskDisplayServiceTest {
         group.setName("登录功能");
         when(groups.selectList(any())).thenReturn(List.of(group));
 
-        TaskListItemResponse item = service.list(projectId, actor, null, null, null, null, null, null, null, "req")
+        TaskListItemResponse item = service.list(projectId, actor, null, null, null, null, null, null, null, null, "req")
                 .data().getFirst();
 
         assertEquals("EXECUTION_FAILED", item.getAttention().getKind());
@@ -471,7 +472,7 @@ class TaskDisplayServiceTest {
         TaskStepEntity planner = step(UUID.randomUUID(), task.getId(), "PENDING");
         planner.setRole("PLANNER");
         when(steps.selectList(any())).thenReturn(List.of(planner));
-        when(runs.selectList(any())).thenReturn(List.of());
+        when(runs.selectLatestForTaskList(any())).thenReturn(List.of());
         UserEntity creator = new UserEntity();
         creator.setId(creatorId);
         creator.setDisplayName("陈同学");
@@ -482,7 +483,7 @@ class TaskDisplayServiceTest {
         when(groups.selectList(any())).thenReturn(List.of(group));
         when(groupService.visibleGroupIds(projectId, actor)).thenReturn(List.of(groupId));
 
-        TaskListItemResponse item = service.list(projectId, actor, null, null, null, null, null, null, null, "req")
+        TaskListItemResponse item = service.list(projectId, actor, null, null, null, null, null, null, null, null, "req")
                 .data().getFirst();
 
         // PLANNER 不计入执行统计：规划期总步骤 0、无当前阶段
@@ -571,7 +572,7 @@ class TaskDisplayServiceTest {
         when(tasks.selectList(any())).thenReturn(List.of(task));
         when(groupService.visibleGroupIds(projectId, actor)).thenReturn(List.of(groupId));
 
-        service.list(projectId, actor, null, null, null, null, "登录", null, null, "req");
+        service.list(projectId, actor, null, null, null, null, null, "登录", null, null, "req");
 
         ArgumentCaptor<AbstractWrapper<TaskEntity, ?, ?>> captor = ArgumentCaptor.forClass(AbstractWrapper.class);
         verify(tasks).selectList(captor.capture());
@@ -598,7 +599,7 @@ class TaskDisplayServiceTest {
         when(tasks.selectList(any())).thenReturn(List.of(task));
         when(groupService.visibleGroupIds(projectId, actor)).thenReturn(List.of(groupId));
 
-        service.list(projectId, actor, null, null, null, null, "   ", null, null, "req");
+        service.list(projectId, actor, null, null, null, null, null, "   ", null, null, "req");
 
         ArgumentCaptor<AbstractWrapper<TaskEntity, ?, ?>> captor = ArgumentCaptor.forClass(AbstractWrapper.class);
         verify(tasks).selectList(captor.capture());
@@ -609,7 +610,7 @@ class TaskDisplayServiceTest {
     void listRejectsKeywordLongerThan100UnicodeCharacters() {
         UUID projectId = UUID.randomUUID(), actor = UUID.randomUUID();
         ApiException ex = assertThrows(ApiException.class,
-                () -> service.list(projectId, actor, null, null, null, null, "长".repeat(101), null, null, "req"));
+                () -> service.list(projectId, actor, null, null, null, null, null, "长".repeat(101), null, null, "req"));
         assertEquals(HttpStatus.UNPROCESSABLE_ENTITY, ex.status());
         assertEquals("INVALID_QUERY_PARAMETER", ex.code());
     }

@@ -22,6 +22,8 @@ import java.util.UUID;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.*;
+import org.springframework.http.HttpStatus;
+import qg.qgent.api.ApiException;
 
 class MrFirstAutomationServiceTest {
     private final TaskMapper tasks = mock(TaskMapper.class);
@@ -86,6 +88,40 @@ class MrFirstAutomationServiceTest {
     }
 
     @Test
+    void approvedRepositoryCreatesMrEvenWhenAnotherRepositoryIsNotReady() {
+        UUID projectId = UUID.randomUUID();
+        UUID taskId = UUID.randomUUID();
+        UUID workspaceId = UUID.randomUUID();
+        UUID approvedRepositoryId = UUID.randomUUID();
+        UUID waitingRepositoryId = UUID.randomUUID();
+        UUID dryRunId = UUID.randomUUID();
+        UUID creator = UUID.randomUUID();
+        TaskEntity task = task(projectId, taskId, workspaceId);
+        task.setCreatedBy(creator);
+        DryRunEntity dryRun = new DryRunEntity();
+        dryRun.setId(dryRunId);
+        dryRun.setProjectId(projectId);
+        dryRun.setTaskId(taskId);
+        dryRun.setProjectRepositoryId(approvedRepositoryId);
+        dryRun.setTargetBranch("main");
+        dryRun.setStatus("PASSED");
+        WorkspaceRepositoryEntity approved = worktree(workspaceId, approvedRepositoryId, "main");
+        WorkspaceRepositoryEntity waiting = worktree(workspaceId, waitingRepositoryId, "main");
+        when(dryRuns.selectById(dryRunId)).thenReturn(dryRun);
+        when(tasks.selectById(taskId)).thenReturn(task);
+        when(worktrees.selectByWorkspace(workspaceId)).thenReturn(List.of(approved, waiting));
+        when(repositories.selectById(approvedRepositoryId)).thenReturn(new ProjectRepositoryEntity());
+        when(preflightGates.get(projectId, taskId, approvedRepositoryId, "main", creator))
+                .thenReturn(new PreflightGateResponse(null, null, null, null, null, "PASSED", List.of(), null, null));
+        when(preflightGates.get(projectId, taskId, waitingRepositoryId, "main", creator))
+                .thenReturn(new PreflightGateResponse(null, null, null, null, null, "WAITING_CQ", List.of(), null, null));
+
+        service.onCqApproved(new PreflightCqApprovedDomainEvent(projectId, dryRunId));
+
+        verify(mrService).create(eq(projectId), eq(creator), any(MergeRequestCreateRequest.class));
+    }
+
+    @Test
     void failedDryRunDoesNotCreateMergeRequest() {
         UUID projectId = UUID.randomUUID();
         UUID taskId = UUID.randomUUID();
@@ -127,6 +163,28 @@ class MrFirstAutomationServiceTest {
 
         verify(preflightService).requestPreflight(projectId, creator, taskId, repositoryId, null);
         verify(mrService, never()).create(any(), any(), any());
+    }
+
+    @Test
+    void noChangesFailureDoesNotBlockOtherRepositoriesOrFailTask() {
+        UUID projectId = UUID.randomUUID();
+        UUID taskId = UUID.randomUUID();
+        UUID workspaceId = UUID.randomUUID();
+        UUID repositoryId = UUID.randomUUID();
+        UUID creator = UUID.randomUUID();
+        TaskEntity waiting = task(projectId, taskId, workspaceId);
+        waiting.setCreatedBy(creator);
+        WorkspaceRepositoryEntity worktree = worktree(workspaceId, repositoryId, "main");
+        when(tasks.selectById(taskId)).thenReturn(waiting);
+        when(worktrees.selectByWorkspace(workspaceId)).thenReturn(List.of(worktree));
+        doThrow(new ApiException(HttpStatus.CONFLICT, "MR_NO_CHANGES",
+                "源分支与目标分支当前提交相同，没有可创建 MR 的变更"))
+                .when(preflightService).requestPreflight(projectId, creator, taskId, repositoryId, null);
+
+        service.onPreflightRequested(new MrFirstPreflightRequestedDomainEvent(projectId, taskId));
+
+        verify(tasks, never()).failMrPreflightNoChanges(projectId, taskId);
+        verify(preflightService).requestPreflight(projectId, creator, taskId, repositoryId, null);
     }
 
     private TaskEntity task(UUID projectId, UUID taskId, UUID workspaceId) {

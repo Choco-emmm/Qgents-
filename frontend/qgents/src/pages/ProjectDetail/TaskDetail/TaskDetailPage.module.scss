@@ -31,6 +31,12 @@
   grid-template-columns: minmax(0, 1fr) minmax(clamp(200px, 10vw + 60px, 100%), clamp(240px, 12vw + 80px, 100%));
   gap: clamp(8px, 0.3vw + 6px, 100%);
   overflow: hidden;
+  transition: grid-template-columns 180ms ease, gap 180ms ease;
+}
+
+.taskWorkspaceAsideCollapsed {
+  grid-template-columns: minmax(0, 1fr) 32px;
+  gap: 0;
 }
 
 .taskWorkspaceMain {
@@ -41,11 +47,55 @@
 }
 
 .taskWorkspaceAside {
+  position: relative;
   min-width: 0;
   min-height: 0;
   overflow-y: auto;
   padding: clamp(3px, 0.15vw + 2px, 100%) 0 0 clamp(5px, 0.15vw + 3px, 100%);
   border-left: 1px solid #e9eef4;
+}
+
+.taskWorkspaceAside::before {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: -1px;
+  width: 1px;
+  background: #dce5ef;
+  content: '';
+  transition: background-color 160ms ease;
+}
+
+.taskWorkspaceAside:hover::before,
+.taskWorkspaceAside:focus-within::before {
+  background: #9fc4ed;
+}
+
+.runInspectorToggle {
+  position: absolute;
+  top: 8px;
+  left: -14px;
+  z-index: 5;
+  display: grid;
+  width: 28px;
+  height: 28px;
+  place-items: center;
+  margin: 0;
+  padding: 0 !important;
+  border: 1px solid #dbe5ef !important;
+  border-radius: 7px !important;
+  background: #fff !important;
+  box-shadow: 0 1px 3px rgb(23 43 77 / 8%);
+  color: #70839a !important;
+  transition: border-color 160ms ease, color 160ms ease, background-color 160ms ease, box-shadow 160ms ease;
+}
+
+.runInspectorToggle:hover,
+.runInspectorToggle:focus-visible {
+  border-color: #a8cbef !important;
+  background: #f2f8ff !important;
+  box-shadow: 0 2px 6px rgb(22 119 255 / 14%);
+  color: #2563a8 !important;
 }
 
 .taskWorkspaceAside :global(.ant-typography),
@@ -960,8 +1010,10 @@
   min-width: 0;
   align-items: center;
   gap: clamp(4px, 0.15vw + 3px, 100%);
-  padding-left: 8px;
-  border-left: 3px solid #1677ff;
+  padding: 8px 10px;
+  border-left: 4px solid #1677ff;
+  border-radius: 0 6px 6px 0;
+  background: #eef6ff;
 }
 
 .inspectorHeading {
@@ -986,7 +1038,7 @@
   gap: clamp(3px, 0.1vw + 2px, 100%);
 }
 
-.inspectorTimeline>div {
+.inspectorTimelineItem {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: center;
@@ -995,6 +1047,9 @@
   border: 1px solid #edf1f5;
   border-radius: clamp(4px, 0.1vw + 3px, 100%);
 }
+.inspectorTimelineContent { display: grid; min-width: 0; gap: 2px; }
+.inspectorTimelineContent > :global(.ant-typography) { min-width: 0; }
+.inspectorTimelineError { display: block; min-width: 0; font-size: 11px; }
 
 .inspectorLogs {
   display: grid;
@@ -1229,24 +1284,57 @@
 }
 
 .workspaceDiffPreviewPatch {
+  display: block;
   height: 100%;
   max-height: 360px;
   margin: 0;
   overflow: auto;
+  overscroll-behavior: contain;
   border: 1px solid #e7edf3;
   border-radius: 6px;
   background: #f8fafc;
   color: #26364d;
+  white-space: normal;
+}
+
+.workspaceDiffPreviewPatchRow {
+  display: grid;
+  grid-template-columns: 52px 52px 24px max-content;
+  width: max-content;
+  min-width: 100%;
+  min-height: 22px;
   font-family: 'Cascadia Mono', Consolas, monospace;
   font-size: 12px;
   line-height: 1.55;
-  white-space: pre;
+  white-space: normal;
 }
 
-.workspaceDiffPreviewPatch span {
+.workspaceDiffPreviewPatchRow:hover {
+  background: rgba(52, 126, 255, 0.06);
+}
+
+.workspaceDiffPreviewPatchLineNumber {
+  box-sizing: border-box;
+  padding: 0 8px;
+  overflow: hidden;
+  color: #8c9bad;
+  text-align: right;
+  user-select: none;
+}
+
+.workspaceDiffPreviewPatchMarker {
+  box-sizing: border-box;
+  padding: 0 4px;
+  font-weight: 700;
+  text-align: center;
+  user-select: none;
+}
+
+.workspaceDiffPreviewPatchCode {
   display: block;
   min-width: max-content;
-  padding: 0 10px;
+  padding: 0 10px 0 4px;
+  white-space: pre;
 }
 
 .workspaceDiffPreviewPatchAdded { background: #dafbe1; color: #116329; }
@@ -1589,6 +1677,7 @@
 .recentExecutionList { display: grid; min-width: 0; gap: 2px; padding: 2px 0; }
 .recentRunItem { display: grid; width: 100%; grid-template-columns: 8px minmax(0, 1fr) auto; gap: 8px; align-items: center; padding: 8px 10px; border: 0; border-left: 2px solid transparent; border-radius: 5px; }
 .runStatusDot { width: 7px; height: 7px; border-radius: 50%; background: #a3afc0; }
+.runStatusSpinner { display: inline-flex; align-items: center; justify-content: center; width: 7px; height: 7px; }
 .runStatusDot[data-status='RUNNING'] { background: #1677ff; }
 .runStatusDot[data-status='SUCCEEDED'] { background: #16a34a; }
 .runStatusDot[data-status='FAILED'], .runStatusDot[data-status='BLOCKED'], .runStatusDot[data-status='CANCELLED'] { background: #dc2626; }
@@ -1665,12 +1754,29 @@
   flex: 1 1 auto;
   margin: 0 !important;
   overflow: hidden;
-  color: #102a43 !important;
-  font-size: 20px !important;
-  font-weight: 700 !important;
-  line-height: 1.25 !important;
+  color: #0b3d78 !important;
+  font-size: 22px !important;
+  font-weight: 800 !important;
+  line-height: 1.3 !important;
   text-overflow: ellipsis;
-  white-space: nowrap;
+  white-space: normal;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.inspectorTitleBlock {
+  display: grid !important;
+  align-items: start !important;
+  gap: 3px !important;
+}
+
+.inspectorStepLabel {
+  color: #1677ff !important;
+  font-size: 11px !important;
+  font-weight: 700;
+  letter-spacing: 0.06em;
 }
 
 .inspectorRunStatus {
@@ -1712,7 +1818,7 @@
 
 .taskWorkspaceAside {
   display: flex;
-  overflow: hidden;
+  overflow: visible;
 }
 
 .runInspectorPanel {
@@ -1849,7 +1955,7 @@
   gap: 6px;
 }
 
-.inspectorTimeline > div,
+.inspectorTimelineItem,
 .inspectorDiagnosticItem {
   padding: 8px 10px;
 }
@@ -1860,4 +1966,14 @@
   min-height: 200px;
   overflow-y: auto;
   align-content: start;
+}
+
+.internalTracePlaceholder {
+  display: grid;
+  min-height: 112px;
+  align-items: center;
+  padding: 12px;
+  border: 1px solid #edf1f5;
+  border-radius: 6px;
+  background: #fafcff;
 }

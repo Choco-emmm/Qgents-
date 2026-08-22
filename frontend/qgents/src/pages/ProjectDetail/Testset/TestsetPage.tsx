@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react'
-import { useNavigate, useParams } from 'react-router-dom'
+import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import {
   Button,
   Card,
@@ -55,6 +55,7 @@ const pageTheme = {
 export function TestsetPage() {
   const { projectId = '' } = useParams<{ projectId: string }>()
   const navigate = useNavigate()
+  const [, setSearchParams] = useSearchParams()
 
   const [configOpen, setConfigOpen] = useState(false)
 
@@ -126,9 +127,9 @@ export function TestsetPage() {
               icon={<SettingOutlined />}
               onClick={() => setConfigOpen(true)}
               disabled={!isAdmin}
-              title={isAdmin ? '配置分支策略与质量门禁' : '仅 Project Admin 可配置'}
+              title={isAdmin ? '配置分支质量门禁' : '仅 Project Admin 可配置'}
             >
-              分支策略与门禁
+              分支质量门禁
             </Button>
           </Space>
         </header>
@@ -137,6 +138,7 @@ export function TestsetPage() {
         <Row gutter={[16, 16]} style={{ marginBottom: 24 }}>
           <Col xs={24} sm={12} lg={8}>
             <Card
+              className={styles.entryCard}
               hoverable
               onClick={() => {
                 void navigate(PATHS.projectTestsetsManage(projectId))
@@ -144,7 +146,7 @@ export function TestsetPage() {
               bodyStyle={{ padding: 20, minHeight: 140 }}
             >
               <Space direction="vertical" size={10} style={{ width: '100%' }}>
-                <Space size={12} align="start">
+                <Space size={12} align="start" className={styles.entryRow}>
                   <DatabaseOutlined
                     style={{
                       fontSize: 26,
@@ -153,7 +155,7 @@ export function TestsetPage() {
                       flexShrink: 0,
                     }}
                   />
-                  <div style={{ flex: 1 }}>
+                  <div className={styles.entryBody}>
                     <Text strong style={{ fontSize: 16, display: 'block' }}>
                       Testset 管理
                     </Text>
@@ -166,6 +168,7 @@ export function TestsetPage() {
                     </Space>
                   </div>
                   <ArrowRightOutlined
+                    className={styles.entryArrow}
                     style={{ color: '#6d7d95', flexShrink: 0, paddingTop: 4 }}
                   />
                 </Space>
@@ -175,6 +178,7 @@ export function TestsetPage() {
 
           <Col xs={24} sm={12} lg={8}>
             <Card
+              className={styles.entryCard}
               hoverable
               onClick={() => {
                 void navigate(PATHS.projectQualityGate(projectId))
@@ -182,7 +186,7 @@ export function TestsetPage() {
               bodyStyle={{ padding: 20, minHeight: 140 }}
             >
               <Space direction="vertical" size={10} style={{ width: '100%' }}>
-                <Space size={12} align="start">
+                <Space size={12} align="start" className={styles.entryRow}>
                   <PlayCircleOutlined
                     style={{
                       fontSize: 26,
@@ -191,7 +195,7 @@ export function TestsetPage() {
                       flexShrink: 0,
                     }}
                   />
-                  <div style={{ flex: 1 }}>
+                  <div className={styles.entryBody}>
                     <Text strong style={{ fontSize: 16, display: 'block' }}>
                       质量门禁审查
                     </Text>
@@ -204,6 +208,7 @@ export function TestsetPage() {
                     </Space>
                   </div>
                   <ArrowRightOutlined
+                    className={styles.entryArrow}
                     style={{ color: '#6d7d95', flexShrink: 0, paddingTop: 4 }}
                   />
                 </Space>
@@ -212,9 +217,9 @@ export function TestsetPage() {
           </Col>
 
           <Col xs={24} sm={24} lg={8}>
-            <Card bodyStyle={{ padding: 20, minHeight: 140 }}>
+            <Card className={styles.entryCard} bodyStyle={{ padding: 20, minHeight: 140 }}>
               <Space direction="vertical" size={10} style={{ width: '100%' }}>
-                <Space size={12} align="start">
+                <Space size={12} align="start" className={styles.entryRow}>
                   <MergeOutlined
                     style={{
                       fontSize: 26,
@@ -223,18 +228,30 @@ export function TestsetPage() {
                       flexShrink: 0,
                     }}
                   />
-                  <div style={{ flex: 1 }}>
+                  <div className={styles.entryBody}>
                     <Text strong style={{ fontSize: 16, display: 'block' }}>
                       MR 合并管理
                     </Text>
                     <Paragraph type="secondary" style={{ margin: '6px 0 8px', fontSize: 13 }}>
                       查看项目所有 MR；Project Admin 在质量门禁通过后执行合并。
                     </Paragraph>
-                    <Space size={8}>
+                    <Space size={8} wrap className={styles.entryTags}>
                       <Tag color={isAdmin ? 'success' : 'default'}>
                         {isAdmin ? '可执行合并' : '仅查看'}
                       </Tag>
                       <Tag color="cyan">{repositories.length} 个仓库</Tag>
+                      <Button
+                        type="link"
+                        size="small"
+                        onClick={() => {
+                          setSearchParams({ tab: 'mr', status: 'OPEN' }, { replace: true })
+                          window.requestAnimationFrame(() => {
+                            document.getElementById('project-mr-list')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+                          })
+                        }}
+                      >
+                        查看进行中 MR
+                      </Button>
                     </Space>
                   </div>
                 </Space>
@@ -244,7 +261,7 @@ export function TestsetPage() {
         </Row>
 
         {/* MR 列表（列表项不可点击，合并按钮在行内操作列） */}
-        <div className={styles.mrTab}>
+        <div id="project-mr-list" className={styles.mrTab}>
           <MergeRequestTab
             projectId={projectId}
             repositories={repositories}

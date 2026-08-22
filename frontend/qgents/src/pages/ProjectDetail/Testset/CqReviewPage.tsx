@@ -1,7 +1,8 @@
-import { useMemo } from 'react'
+import { useMemo, useState } from 'react'
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import {
   App,
+  Alert,
   BackTop,
   Button,
   Card,
@@ -13,12 +14,12 @@ import {
   Tag,
   Typography,
   Descriptions,
-  Modal,
 } from 'antd'
 import {
   CheckCircleFilled,
   CloseCircleFilled,
   ClockCircleFilled,
+  CodeOutlined,
   LeftOutlined,
   LockOutlined,
 } from '@ant-design/icons'
@@ -33,12 +34,14 @@ import {
   useMergeRequest,
   useMergeRequestChecks,
   useRejectMergeRequestCq,
+  useDiffs,
   useTask,
 } from '@/hooks/task-model'
 import { PATHS } from '@/routes/paths'
 import { findCqCheck, isMergeRequestAuthor } from '../cqSeal'
 import { CqSealCard } from '../MergeRequestDetail/CqSealCard'
 import { formatApiError } from '@/utils/formatApiError'
+import { ApiError } from '@/api/client'
 import type { Preflight } from '@/types/qualityGate'
 import styles from './CqReviewPage.module.scss'
 
@@ -73,10 +76,13 @@ export default function CqReviewPage() {
   const navigate = useNavigate()
   const { user } = useAuth()
   const { message, modal } = App.useApp()
+  const [submittedDecision, setSubmittedDecision] = useState<'APPROVED' | 'REJECTED' | null>(null)
+  const [reviewLocked, setReviewLocked] = useState(false)
 
   const mergeRequestId = searchParams.get('mr')?.trim() || ''
   const taskId = searchParams.get('taskId')?.trim() || ''
   const repositoryId = searchParams.get('repositoryId')?.trim() || ''
+  const targetBranchParam = searchParams.get('targetBranch')?.trim() || ''
 
   // ========== 模式 A：MR 级入口（?mr=） ==========
   const mrQuery = useMergeRequest(projectId, mergeRequestId)
@@ -89,10 +95,10 @@ export default function CqReviewPage() {
   const taskQuery = useTask(projectId, taskId)
   const task = taskId ? taskQuery.data : mrTaskQuery.data
   const targetBranch = useMemo(() => {
-    if (!task || !repositoryId) return ''
-    const summary = task.repositories?.find((r) => r.repositoryId === repositoryId)
-    return summary?.baseRef || ''
-  }, [task, repositoryId])
+    if (!repositoryId) return targetBranchParam
+    const summary = task?.repositories?.find((r) => r.repositoryId === repositoryId)
+    return summary?.baseRef || targetBranchParam
+  }, [task, repositoryId, targetBranchParam])
   const preflightQuery = usePreflight(projectId, taskId, repositoryId, targetBranch)
   const approveDryCq = useApproveDryRunCq(projectId)
   const rejectDryCq = useRejectDryRunCq(projectId)
@@ -116,7 +122,35 @@ export default function CqReviewPage() {
   const preflight: Preflight | null = byPreflight && preflightQuery.data ? preflightQuery.data : null
   const dryRun = preflight?.dryRun ?? null
   const cqPlusOne = preflight?.cqPlusOne ?? null
-  const dryRunCqStatus = cqPlusOne?.status ?? 'PENDING' // PENDING | APPROVED | REJECTED
+  const preflightUnavailable = byPreflight
+    && !preflightQuery.isLoading
+    && (preflightQuery.isError || !preflightQuery.data)
+  const reviewTaskId = taskId || mrQuery.data?.taskId || ''
+  const reviewRepositoryId = repositoryId || mrQuery.data?.repositoryId || ''
+  const diffsQuery = useDiffs(projectId, { taskId: reviewTaskId || undefined, limit: 100 })
+  const reviewDiff = useMemo(() => {
+    const sourceCommit = preflight?.sourceCommit || mrQuery.data?.headCommit || ''
+    return (diffsQuery.data?.data ?? [])
+      .filter((diff) => !reviewRepositoryId || diff.repositoryId === reviewRepositoryId)
+      .sort((left, right) => {
+        const leftMatches = sourceCommit && left.headCommit === sourceCommit ? 1 : 0
+        const rightMatches = sourceCommit && right.headCommit === sourceCommit ? 1 : 0
+        if (leftMatches !== rightMatches) return rightMatches - leftMatches
+        const leftAccepted = left.status === 'ACCEPTED' ? 1 : 0
+        const rightAccepted = right.status === 'ACCEPTED' ? 1 : 0
+        if (leftAccepted !== rightAccepted) return rightAccepted - leftAccepted
+        return right.createdAt.localeCompare(left.createdAt)
+      })[0] ?? null
+  }, [diffsQuery.data, mrQuery.data?.headCommit, preflight?.sourceCommit, reviewRepositoryId])
+  const dryRunCqStatus = (() => {
+    if (submittedDecision) return submittedDecision
+    // Preflight 接口 cqPlusOne.status 的合法值是 'MISSING' | 'APPROVED' | 'REJECTED'
+    // （参见 types/qualityGate.ts PreflightCqPlusOneStatus）。
+    // 本页内部 CQ 状态机统一用 'PENDING' 表示"等待审查"，因此把 'MISSING' 与 null/undefined 归一化。
+    const raw = cqPlusOne?.status
+    if (raw === 'APPROVED' || raw === 'REJECTED') return raw
+    return 'PENDING'
+  })() // 'PENDING' | 'APPROVED' | 'REJECTED'
   const cqStatus = byMr
     ? (cqFromMr?.status ?? 'PENDING')
     : dryRunCqStatus === 'APPROVED'
@@ -137,17 +171,20 @@ export default function CqReviewPage() {
     ? mrQuery.error?.message
     : (taskQuery.error?.message || preflightQuery.error?.message)
 
-  const canReview =
-    (byMr ? mr?.status === 'OPEN' : dryRun?.status === 'PASSED') && !isAuthor
+  const canReview = byMr
+    ? mr?.status === 'OPEN' && (!cqFromMr || cqFromMr.status === 'PENDING') && !isAuthor
+    : dryRun?.status === 'PASSED'
+    // 注意：Preflight 接口返回 cqPlusOne.status∈{MISSING,APPROVED,REJECTED}，
+    // 但 dryRunCqStatus 已经把 MISSING 归一化成 PENDING；这里仍兼容原始 MISSING 作为双保险。
+    && (dryRunCqStatus === 'PENDING' || dryRunCqStatus === 'MISSING' as string)
+    && !preflightUnavailable
+    && !isAuthor
+    && !reviewLocked
 
   // ========== 返回按钮 ==========
   function goBack() {
-    if (byMr) {
-      navigate(PATHS.projectTestset(projectId))
-    } else {
-      // Preflight 入口：回到 TaskDetailPage
-      navigate(`${PATHS.projectTasks(projectId)}/${taskId}`)
-    }
+    // 返回测试集页面
+    navigate(PATHS.projectTestset(projectId))
   }
 
   // ========== CQ 提交：自动按模式选接口 ==========
@@ -207,10 +244,23 @@ export default function CqReviewPage() {
           } else if (byPreflight && dryRun?.id) {
             const mutate = rejecting ? rejectDryCq.mutateAsync : approveDryCq.mutateAsync
             await mutate({ dryRunId: dryRun.id, input: { reason: reason.trim() } })
+            // The backend creates the MR asynchronously. Lock this page from
+            // the successful response so a stale refetch cannot reopen CQ.
+            setSubmittedDecision(rejecting ? 'REJECTED' : 'APPROVED')
+            setReviewLocked(true)
             void preflightQuery.refetch()
           }
           message.success(rejecting ? '已拒绝 CQ+1' : '已盖 CQ+1')
         } catch (error) {
+          const code = error instanceof ApiError && error.body && typeof error.body === 'object'
+            ? ((error.body as { error?: { code?: string } }).error?.code ?? '')
+            : ''
+          if (byPreflight && code === 'PREFLIGHT_CQ_ALREADY_DECIDED') {
+            setReviewLocked(true)
+            void preflightQuery.refetch()
+            message.info('该 Dry Run 已完成 CQ+1 审查，无需重复提交')
+            return
+          }
           message.error(formatApiError(error))
           return Promise.reject(error)
         }
@@ -313,6 +363,9 @@ export default function CqReviewPage() {
   const busy = byMr
     ? approveMrCq.isPending || rejectMrCq.isPending
     : approveDryCq.isPending || rejectDryCq.isPending
+  const busyAction: 'approve' | 'reject' | null = byMr
+    ? approveMrCq.isPending ? 'approve' : rejectMrCq.isPending ? 'reject' : null
+    : approveDryCq.isPending ? 'approve' : rejectDryCq.isPending ? 'reject' : null
 
   // 标题区：两种模式下不同的描述 Tag
   const headerInfo = byMr
@@ -354,9 +407,11 @@ export default function CqReviewPage() {
         },
         {
           key: 'cq',
-          color: cqStatus === 'PASSED' ? 'success' : cqStatus === 'FAILED' ? 'error' : 'default',
+          color: preflightUnavailable || cqStatus === 'FAILED' ? 'error' : cqStatus === 'PASSED' ? 'success' : 'default',
           label:
-            cqStatus === 'PASSED' ? 'CQ+1：已盖章' : cqStatus === 'FAILED' ? 'CQ+1：已拒绝' : 'CQ+1：待审查',
+            preflightUnavailable
+              ? '预检失败'
+              : cqStatus === 'PASSED' ? 'CQ+1：已盖章' : cqStatus === 'FAILED' ? 'CQ+1：已拒绝' : 'CQ+1：待审查',
         },
       ],
     }
@@ -366,7 +421,7 @@ export default function CqReviewPage() {
       <div className={styles.page}>
         <BackTop />
         <button type="button" className={styles.backLink} onClick={goBack}>
-          <LeftOutlined /> {byMr ? '返回质量门禁页' : '返回任务详情'}
+          <LeftOutlined /> 返回质量门禁和MR
         </button>
 
         <header className={styles.header}>
@@ -391,13 +446,12 @@ export default function CqReviewPage() {
             <Card className={styles.content}>
               <div className={styles.sealBlock}>
                 <CqSealCard
-                  projectId={projectId}
-                  mergeRequestId={mr!.id}
                   check={cqFromMr ?? undefined}
                   headCommit={mr!.headCommit}
                   mrStatus={mr!.status}
                   isAuthor={isAuthor}
                   busy={busy}
+                  busyAction={busyAction}
                   onApprove={() => submitCq('approve')}
                   onReject={() => submitCq('reject')}
                 />
@@ -410,12 +464,12 @@ export default function CqReviewPage() {
                   isAuthor={isAuthor}
                   cqStatus={cqStatus}
                   cqReason={cqFromMr?.reviewReason ?? null}
-                  cqReviewedByName={cqFromMr?.reviewedByName ?? null}
                   canAct={canReview}
                   busy={busy}
                   onApprove={() => submitCq('approve')}
                   onReject={() => submitCq('reject')}
-                  reviewerUserId={cqFromMr?.reviewerUserId ?? null}
+                  reviewerUserId={cqFromMr?.reviewedByUserId ?? null}
+                  cqReviewedByName={cqFromMr?.reviewedByName ?? null}
                   reviewedAt={cqFromMr?.completedAt ?? null}
                 />
               </div>
@@ -426,6 +480,16 @@ export default function CqReviewPage() {
         {/* ======== 模式 B：Preflight 级 —— 仅在非 MR 模式下渲染 ======== */}
         {byPreflight && !byMr ? (
           <Card className={styles.content}>
+            {preflightUnavailable ? (
+              <Alert
+                type="error"
+                showIcon
+                message="预检未完成，暂不可进行 CQ+1"
+                description={preflightQuery.error?.message || '预检服务暂时不可用，请稍后重试。'}
+                action={<Button size="small" onClick={() => void preflightQuery.refetch()}>重试</Button>}
+                style={{ marginBottom: 20 }}
+              />
+            ) : null}
             {/* Dry Run 上下文信息 */}
             <Descriptions size="small" column={2} style={{ marginBottom: 20 }} bordered>
               <Descriptions.Item label="Dry Run ID">
@@ -436,7 +500,9 @@ export default function CqReviewPage() {
                 )}
               </Descriptions.Item>
               <Descriptions.Item label="目标分支">
-                {preflight?.targetBranch ? <Text code>{preflight.targetBranch}</Text> : <Text type="secondary">—</Text>}
+                {preflight?.targetBranch || targetBranch ? (
+                  <Text code>{preflight?.targetBranch || targetBranch}</Text>
+                ) : <Text type="secondary">—</Text>}
               </Descriptions.Item>
               <Descriptions.Item label="源提交 (HEAD)">
                 {preflight?.sourceCommit ? <Text code>{preflight.sourceCommit.slice(0, 12)}</Text> : <Text type="secondary">—</Text>}
@@ -445,6 +511,17 @@ export default function CqReviewPage() {
                 {preflight?.targetCommit ? <Text code>{preflight.targetCommit.slice(0, 12)}</Text> : <Text type="secondary">—</Text>}
               </Descriptions.Item>
             </Descriptions>
+            {reviewDiff ? (
+              <Space style={{ marginBottom: 20 }}>
+                <Button
+                  icon={<CodeOutlined />}
+                  onClick={() => navigate(PATHS.projectCodeDiff(projectId, reviewDiff.id))}
+                >
+                  查看代码 Diff
+                </Button>
+                <Text type="secondary">先查看本次提交的文件和行级变更，再决定是否盖 CQ+1。</Text>
+              </Space>
+            ) : null}
 
             {/* 自定义大印章（与 CqSealCard 视觉风格对齐，用 Preflight 数据） */}
             <div className={styles.sealBlock} aria-label="CQ+1 印章">
@@ -455,59 +532,8 @@ export default function CqReviewPage() {
                 sourceCommit={preflight?.sourceCommit ?? null}
                 reason={cqPlusOne?.reason ?? null}
                 reviewedAt={cqPlusOne?.reviewedAt ?? null}
-                reviewerName={null}
+                reviewerName={cqPlusOne?.reviewerName ?? null}
               />
-              <Button
-                type="link"
-                className={styles.sealHistory}
-                onClick={() => {
-                  Modal.info({
-                    title: 'CQ+1 审查记录',
-                    okText: '关闭',
-                    width: 560,
-                    content: (
-                      <>
-                        {dryRunCqStatus === 'PENDING' ? (
-                          <Empty description="尚未有人在当前 Dry Run 上盖章" image={Empty.PRESENTED_IMAGE_SIMPLE} />
-                        ) : (
-                          <ul className={styles.sealHistoryList}>
-                            <li className={styles.sealHistoryItem}>
-                              <div className={styles.sealHistoryHead}>
-                                <strong>
-                                  {cqPlusOne?.reviewerUserId
-                                    ? `用户 ${cqPlusOne.reviewerUserId.slice(0, 8)}`
-                                    : '审查者'}
-                                </strong>
-                                <span
-                                  className={
-                                    dryRunCqStatus === 'APPROVED'
-                                      ? styles.isApproved
-                                      : styles.isRejected
-                                  }
-                                >
-                                  {dryRunCqStatus === 'APPROVED' ? '接受' : '拒绝'}
-                                </span>
-                              </div>
-                              <p className={styles.sealHistoryReason}>
-                                原因：{cqPlusOne?.reason?.trim() || '—'}
-                              </p>
-                              <p className={styles.sealHistoryTime}>
-                                时间：{cqPlusOne?.reviewedAt || '—'}
-                                {preflight?.sourceCommit
-                                  ? ` · ${preflight.sourceCommit.slice(0, 7)}`
-                                  : ''}
-                              </p>
-                            </li>
-                          </ul>
-                        )}
-                      </>
-                    ),
-                  })
-                }}
-                aria-label="view-cq-history"
-              >
-                查看历史
-              </Button>
             </div>
 
             <div className={styles.submitSection}>
@@ -519,8 +545,10 @@ export default function CqReviewPage() {
                 cqStatus={cqStatus}
                 cqReason={cqPlusOne?.reason ?? null}
                 reviewerUserId={cqPlusOne?.reviewerUserId ?? null}
+                cqReviewedByName={cqPlusOne?.reviewerName ?? null}
                 reviewedAt={cqPlusOne?.reviewedAt ?? null}
                 canAct={canReview}
+                unavailable={preflightUnavailable}
                 busy={busy}
                 onApprove={() => submitCq('approve')}
                 onReject={() => submitCq('reject')}
@@ -601,6 +629,7 @@ function SubmitHistoryList({
   reviewerUserId,
   reviewedAt,
   canAct,
+  unavailable,
   busy,
   onApprove,
   onReject,
@@ -612,6 +641,7 @@ function SubmitHistoryList({
   reviewerUserId: string | null
   reviewedAt: string | null
   canAct: boolean
+  unavailable?: boolean
   busy: boolean
   onApprove: () => void
   onReject: () => void
@@ -624,10 +654,10 @@ function SubmitHistoryList({
     <div className={styles.submitList}>
       {canAct ? (
         <div className={styles.submitActions}>
-          <Button type="primary" loading={busy} onClick={onApprove}>
+          <Button type="primary" disabled={busy} onClick={onApprove}>
             盖 CQ+1
           </Button>
-          <Button danger loading={busy} onClick={onReject}>
+          <Button danger disabled={busy} onClick={onReject}>
             拒绝
           </Button>
           <Text type="secondary">请在上方印章处确认审查</Text>
@@ -651,6 +681,14 @@ function SubmitHistoryList({
                 拒绝理由：{cqReason}
               </Paragraph>
             ) : null}
+          </div>
+        </div>
+      ) : unavailable ? (
+        <div className={styles.submitFailed}>
+          <CloseCircleFilled style={{ color: '#dc2626', fontSize: 24 }} />
+          <div>
+            <Text strong>预检未完成，暂不可进行 CQ+1</Text>
+            <Text type="secondary">请等待预检服务恢复后重试</Text>
           </div>
         </div>
       ) : isAuthor ? (

@@ -37,7 +37,7 @@ beforeEach(() => {
 describe('TaskCenterPage', () => {
   it('requests only the Task list with official filters', () => {
     renderPage('/app/projects/project-test/tasks?groupId=group-1&status=RUNNING&createdBy=creator-1')
-    expect(useInfiniteTasksMock).toHaveBeenCalledWith('project-test', { groupId: 'group-1', status: 'RUNNING', createdBy: 'creator-1', repositoryId: undefined, keyword: undefined, limit: 20 })
+    expect(useInfiniteTasksMock).toHaveBeenCalledWith('project-test', { groupId: 'group-1', status: 'RUNNING', excludeStatus: undefined, createdBy: 'creator-1', repositoryId: undefined, keyword: undefined, limit: 20 })
     expect(useTaskMock).not.toHaveBeenCalled()
     expect(useTaskStepsMock).not.toHaveBeenCalled()
     expect(useTaskRunsMock).not.toHaveBeenCalled()
@@ -67,39 +67,45 @@ describe('TaskCenterPage', () => {
     expect(screen.getByText('暂无权限查看任务')).toBeInTheDocument()
   })
 
-  it('uses selected page numbers and a quick-jump control for loaded tasks', async () => {
-    const user = userEvent.setup()
-    const tasks = Array.from({ length: 9 }, (_, index) => ({ ...task, id: `task-${index + 1}`, title: `Task ${index + 1}` }))
+  it('uses the server batch size for pagination instead of splitting one batch by viewport size', () => {
+    const tasks = Array.from({ length: 20 }, (_, index) => ({ ...task, id: `task-${index + 1}`, title: `Task ${index + 1}` }))
     useInfiniteTasksMock.mockReturnValue(result({ data: { pages: [page(tasks)], pageParams: [undefined] } }))
 
     const { container } = renderPage()
 
-    expect(container.querySelector('.ant-pagination-item-active')).toHaveTextContent('1')
-    expect(container.querySelector('.ant-pagination-options-quick-jumper input')).toBeInTheDocument()
-    const pageTwo = container.querySelector<HTMLElement>('.ant-pagination-item-2')
-    if (!pageTwo) throw new Error('Expected page 2 control')
-    await user.click(pageTwo)
-    expect(container.querySelector('.ant-pagination-item-active')).toHaveTextContent('2')
-    const pageOne = container.querySelector<HTMLElement>('.ant-pagination-item-1')
-    if (!pageOne) throw new Error('Expected page 1 control')
-    await user.click(pageOne)
+    expect(screen.getByText('Task 1')).toBeInTheDocument()
+    expect(screen.getByText('Task 20')).toBeInTheDocument()
     expect(container.querySelector('.ant-pagination-item-active')).toHaveTextContent('1')
   })
 
-  it('hides successfully completed tasks by default and shows them on demand', async () => {
+  it('delegates completed-task hiding to the server excludeStatus filter and shows them on demand', async () => {
     const user = userEvent.setup()
-    const completedTask: TaskListItem = { ...task, id: 'task-completed', title: '已完成任务', status: 'SUCCEEDED' }
     useInfiniteTasksMock.mockReturnValue(result({
-      data: { pages: [page([task, completedTask])], pageParams: [undefined] },
+      data: { pages: [page([task])], pageParams: [undefined] },
     }))
 
     renderPage()
 
+    // 默认（无显式筛选）隐藏已完成任务：请求携带 excludeStatus=SUCCEEDED，由服务端过滤保证分页正确。
     expect(screen.getByText('新任务')).toBeInTheDocument()
-    expect(screen.queryByText('已完成任务')).not.toBeInTheDocument()
+    expect(useInfiniteTasksMock).toHaveBeenLastCalledWith('project-test', expect.objectContaining({ excludeStatus: 'SUCCEEDED' }))
+    // 切换「查看已完成任务」→ scope=all → 不再排除 SUCCEEDED；服务端返回的数据直接展示（不再本地过滤）。
     await user.click(screen.getByRole('button', { name: '查看已完成任务' }))
-    expect(await screen.findByText('已完成任务')).toBeInTheDocument()
+    expect(useInfiniteTasksMock).toHaveBeenLastCalledWith('project-test', expect.objectContaining({ excludeStatus: undefined }))
     expect(screen.getByTestId('location')).toHaveTextContent('scope=all')
+  })
+
+  it('does not show stale failure attention while the task is running a retry', () => {
+    const retryingTask: TaskListItem = {
+      ...task,
+      attention: { kind: 'EXECUTION_FAILED', title: '执行失败', summary: 'Agent 执行超时', taskRunId: 'run-old', inputRequestId: null, diffReviewBatchId: null, repositoryId: null, createdAt: task.updatedAt },
+      executionSummary: { ...task.executionSummary, runningSteps: 1, failedSteps: 1 },
+    }
+    useInfiniteTasksMock.mockReturnValue(result({ data: { pages: [page([retryingTask])], pageParams: [undefined] } }))
+
+    renderPage()
+
+    expect(screen.queryByText('执行失败：Agent 执行超时')).not.toBeInTheDocument()
   })
 
   it('keeps rendering when a new Task list item lacks derived summaries', () => {

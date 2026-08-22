@@ -40,6 +40,7 @@ import org.apache.ibatis.builder.MapperBuilderAssistant;
 import qg.qgent.api.ApiException;
 import qg.qgent.dto.BindProjectRepositoryRequest;
 import qg.qgent.dto.CreateRemoteBranchRequest;
+import qg.qgent.dto.GitHubInstallationResponse;
 import qg.qgent.dto.NewProjectRepositoryRequest;
 import qg.qgent.dto.ProjectRepositoryResponse;
 import qg.qgent.dto.RemoteBranchResponse;
@@ -382,23 +383,59 @@ class GitHubRepositoryServiceTest {
         long providerInstallationId = 12345L;
         UUID myTeamId = UUID.randomUUID();
         UUID otherTeamId = UUID.randomUUID();
-        
+
         when(gitHubClient.verifyInstallationState("mock_state")).thenReturn(myTeamId);
         when(gitHubClient.getInstallation(providerInstallationId)).thenReturn(new qg.qgent.github.GitHubInstallationDetails(providerInstallationId, "qgents", "Organization"));
         when(gitHubClient.listRepositories(providerInstallationId)).thenReturn(java.util.List.of());
-        
+
+        // 其他团队的 ACTIVE 安装且仍存在 AUTHORIZED 仓库：视为活跃占用，拒绝接管
         GitHubInstallationEntity existingInstallation = new GitHubInstallationEntity();
         existingInstallation.setId(UUID.randomUUID());
         existingInstallation.setTeamId(otherTeamId);
         existingInstallation.setProviderInstallationId(providerInstallationId);
-        
+        existingInstallation.setStatus("ACTIVE");
         when(installationMapper.selectByProviderInstallationIdForUpdate(anyLong())).thenReturn(existingInstallation);
-        
-        ApiException exception = assertThrows(ApiException.class, 
+        when(repositoryMapper.selectCount(any(Wrapper.class))).thenReturn(1L);
+
+        ApiException exception = assertThrows(ApiException.class,
                 () -> service.handleInstallationCallback(providerInstallationId, "mock_state"));
-                
+
         assertEquals(HttpStatus.CONFLICT, exception.status());
         assertEquals("GITHUB_INSTALLATION_TEAM_CONFLICT", exception.code());
+    }
+
+    @Test
+    void takeoverIdleInstallationFromAnotherTeamRepointsAndReactivates() {
+        long providerInstallationId = 12345L;
+        UUID myTeamId = UUID.randomUUID();
+        UUID otherTeamId = UUID.randomUUID();
+        UUID existingInstallId = UUID.randomUUID();
+
+        when(gitHubClient.verifyInstallationState("mock_state")).thenReturn(myTeamId);
+        when(gitHubClient.getInstallation(providerInstallationId))
+                .thenReturn(new qg.qgent.github.GitHubInstallationDetails(
+                        providerInstallationId, "qgents", "Organization"));
+        when(gitHubClient.listRepositories(providerInstallationId)).thenReturn(java.util.List.of(
+                new qg.qgent.github.GitHubRepositoryDetails(100L, "qgents", "repo1", "main", "PRIVATE", false)));
+
+        // 其他团队的 DELETED 安装，其仓库已全部 REVOKED（无 AUTHORIZED）：视为闲置，允许接管
+        GitHubInstallationEntity existingInstallation = new GitHubInstallationEntity();
+        existingInstallation.setId(existingInstallId);
+        existingInstallation.setTeamId(otherTeamId);
+        existingInstallation.setProviderInstallationId(providerInstallationId);
+        existingInstallation.setStatus("DELETED");
+        when(installationMapper.selectByProviderInstallationIdForUpdate(anyLong())).thenReturn(existingInstallation);
+
+        UUID returnedTeamId = service.handleInstallationCallback(providerInstallationId, "mock_state");
+
+        assertEquals(myTeamId, returnedTeamId);
+        // 安装重新归属当前团队并恢复 ACTIVE
+        ArgumentCaptor<GitHubInstallationEntity> installation = ArgumentCaptor.forClass(GitHubInstallationEntity.class);
+        verify(installationMapper).updateById(installation.capture());
+        assertEquals(existingInstallId, installation.getValue().getId());
+        assertEquals(myTeamId, installation.getValue().getTeamId());
+        assertEquals("ACTIVE", installation.getValue().getStatus());
+        verify(repositoryMapper).insert(any(GitHubRepositoryEntity.class));
     }
 
     @Test
@@ -447,6 +484,39 @@ class GitHubRepositoryServiceTest {
                 .filter(r -> "REVOKED".equals(r.getAuthorizationStatus()))
                 .findFirst().orElseThrow();
         assertEquals(repo2.getId(), revokedRepo.getId());
+    }
+
+    @Test
+    void manualSyncMarksInstallationDeletedWhenGitHubReturnsNotFound() {
+        UUID teamId = UUID.randomUUID();
+        UUID localInstallationId = UUID.randomUUID();
+        long providerInstallationId = 98765L;
+        when(teamMemberMapper.selectCount(any(Wrapper.class))).thenReturn(1L);
+
+        GitHubInstallationEntity installation = new GitHubInstallationEntity();
+        installation.setId(localInstallationId);
+        installation.setTeamId(teamId);
+        installation.setProviderInstallationId(providerInstallationId);
+        installation.setStatus("ACTIVE");
+        when(installationMapper.selectOne(any(Wrapper.class))).thenReturn(installation);
+        when(installationMapper.selectByProviderInstallationIdForUpdate(providerInstallationId))
+                .thenReturn(installation);
+
+        GitHubRepositoryEntity repository = repository("main");
+        repository.setId(UUID.randomUUID());
+        repository.setInstallationId(localInstallationId);
+        repository.setAuthorizationStatus("AUTHORIZED");
+        when(repositoryMapper.selectList(any(Wrapper.class))).thenReturn(List.of(repository));
+        when(gitHubClient.getInstallation(providerInstallationId))
+                .thenThrow(new ApiException(HttpStatus.NOT_FOUND, "GITHUB_INSTALLATION_NOT_FOUND", "missing"));
+
+        GitHubInstallationResponse response = service.manualSyncInstallation(actorId, teamId, localInstallationId);
+
+        assertEquals("DELETED", response.getStatus());
+        assertEquals("DELETED", installation.getStatus());
+        assertEquals("REVOKED", repository.getAuthorizationStatus());
+        verify(installationMapper).updateById(installation);
+        verify(repositoryMapper).updateById(repository);
     }
 
     @Test
@@ -587,10 +657,11 @@ class GitHubRepositoryServiceTest {
     }
 
     @Test
-    void syncDoesNotRestoreDeletedInstallationFromStaleSnapshot() {
+    void syncReactivatesDeletedInstallationWhenGitHubConfirmsItLive() {
         long providerInstallationId = 12345L;
         UUID teamId = UUID.randomUUID();
 
+        // 本请求刚成功拉取 GitHub 实时快照：安装已重新授权，不是陈旧快照，允许恢复 ACTIVE
         when(gitHubClient.verifyInstallationState("mock_state")).thenReturn(teamId);
         when(gitHubClient.getInstallation(providerInstallationId))
                 .thenReturn(new qg.qgent.github.GitHubInstallationDetails(
@@ -607,9 +678,11 @@ class GitHubRepositoryServiceTest {
 
         service.handleInstallationCallback(providerInstallationId, "mock_state");
 
-        verify(installationMapper, never()).updateById(any(GitHubInstallationEntity.class));
-        verify(repositoryMapper, never()).insert(any(GitHubRepositoryEntity.class));
-        verify(repositoryMapper, never()).updateById(any(GitHubRepositoryEntity.class));
+        // DELETED 且 GitHub 确认 live：恢复 ACTIVE 并重新同步仓库
+        ArgumentCaptor<GitHubInstallationEntity> installation = ArgumentCaptor.forClass(GitHubInstallationEntity.class);
+        verify(installationMapper).updateById(installation.capture());
+        assertEquals("ACTIVE", installation.getValue().getStatus());
+        verify(repositoryMapper).insert(any(GitHubRepositoryEntity.class));
     }
 
     private GitHubRepositoryEntity repository(String branch) {
@@ -974,6 +1047,7 @@ class GitHubRepositoryServiceTest {
         installation.setTeamId(teamId);
         installation.setProviderInstallationId(12345L);
         installation.setAccountType("USER");
+        installation.setRepositorySelection("ALL");
         installation.setAccountLogin("personal-user");
         installation.setStatus("ACTIVE");
         when(installationMapper.selectList(any(Wrapper.class))).thenReturn(java.util.List.of(installation));
@@ -1001,6 +1075,7 @@ class GitHubRepositoryServiceTest {
         installation.setTeamId(teamId);
         installation.setProviderInstallationId(12345L);
         installation.setAccountType("USER");
+        installation.setRepositorySelection("ALL");
         installation.setAccountLogin("personal-user");
         installation.setStatus("ACTIVE");
         when(installationMapper.selectById(installationId)).thenReturn(installation);
@@ -1021,6 +1096,33 @@ class GitHubRepositoryServiceTest {
     }
 
     @Test
+    void personalRepositoryCreationRejectsSelectedInstallationBeforeCreatingRepository() {
+        service = serviceWithOAuth();
+        UUID teamId = UUID.randomUUID();
+        when(teamMemberMapper.selectCount(any(Wrapper.class))).thenReturn(1L);
+
+        GitHubInstallationEntity installation = new GitHubInstallationEntity();
+        installation.setId(installationId);
+        installation.setTeamId(teamId);
+        installation.setProviderInstallationId(12345L);
+        installation.setAccountType("USER");
+        installation.setAccountLogin("personal-user");
+        installation.setRepositorySelection("SELECTED");
+        installation.setStatus("ACTIVE");
+        when(installationMapper.selectById(installationId)).thenReturn(installation);
+        when(githubOAuthService.requirePersonalCredential(actorId)).thenReturn(
+                new GitHubOAuthService.PersonalCredential("oauth-token", 77L, "personal-user", List.of("repo")));
+
+        ApiException exception = assertThrows(ApiException.class, () -> service.createRemoteRepository(actorId, teamId,
+                newRepositoryRequest("personal-repo", installationId)));
+
+        assertEquals(HttpStatus.FORBIDDEN, exception.status());
+        assertEquals("GITHUB_INSTALLATION_REPOSITORY_SCOPE_INSUFFICIENT", exception.code());
+        verify(githubOAuthClient, never()).createPersonalRepository(anyString(), any());
+        verify(gitHubClient, never()).listRepositories(anyLong());
+    }
+
+    @Test
     void personalRepositoryCreationRejectsWhenAppCannotSeeRepositoryAndCompensates() {
         service = serviceWithOAuth();
         UUID teamId = UUID.randomUUID();
@@ -1031,6 +1133,7 @@ class GitHubRepositoryServiceTest {
         installation.setTeamId(teamId);
         installation.setProviderInstallationId(12345L);
         installation.setAccountType("USER");
+        installation.setRepositorySelection("ALL");
         installation.setAccountLogin("personal-user");
         installation.setStatus("ACTIVE");
         when(installationMapper.selectById(installationId)).thenReturn(installation);
@@ -1061,6 +1164,7 @@ class GitHubRepositoryServiceTest {
         installation.setTeamId(teamId);
         installation.setProviderInstallationId(12345L);
         installation.setAccountType("USER");
+        installation.setRepositorySelection("ALL");
         installation.setAccountLogin("personal-user");
         installation.setStatus("ACTIVE");
         when(installationMapper.selectById(installationId)).thenReturn(installation);
@@ -1090,6 +1194,7 @@ class GitHubRepositoryServiceTest {
         installation.setTeamId(teamId);
         installation.setProviderInstallationId(12345L);
         installation.setAccountType("USER");
+        installation.setRepositorySelection("ALL");
         installation.setAccountLogin("personal-user");
         installation.setStatus("ACTIVE");
         when(installationMapper.selectById(installationId)).thenReturn(installation);
@@ -1114,6 +1219,7 @@ class GitHubRepositoryServiceTest {
         GitHubInstallationEntity installation = new GitHubInstallationEntity();
         installation.setId(installationId);
         installation.setAccountType("USER");
+        installation.setRepositorySelection("ALL");
         installation.setAccountLogin("personal-user");
         GitHubRepositoryDetails created = new GitHubRepositoryDetails(
                 7004L, "personal-user", "personal-repo", "main", "PRIVATE", false);
@@ -1132,6 +1238,7 @@ class GitHubRepositoryServiceTest {
         GitHubInstallationEntity installation = new GitHubInstallationEntity();
         installation.setId(installationId);
         installation.setAccountType("USER");
+        installation.setRepositorySelection("ALL");
         installation.setAccountLogin("personal-user");
         GitHubRepositoryDetails created = new GitHubRepositoryDetails(
                 7005L, "personal-user", "personal-repo", "main", "PRIVATE", false);

@@ -55,6 +55,7 @@ public class MergeRequestService {
     private final ConcurrentHashMap<String, CachedMrPage> listCache = new ConcurrentHashMap<>();
     private static final Logger log = LoggerFactory.getLogger(MergeRequestService.class);
     private static final int DEFAULT_LIMIT = 20;
+    private static final int DEFAULT_COMMIT_LIMIT = 3;
     private static final int MAX_LIMIT = 100;
     private static final Duration MERGE_OPERATION_LEASE = Duration.ofMinutes(20);
     /**
@@ -88,6 +89,8 @@ public class MergeRequestService {
     private final MergeRequestDeliveryOperationMapper deliveryOperationMapper;
     private final TransactionTemplate transactions;
     private final DiffMapper diffMapper;
+    /** 人工 CQ 审查记录的显示名快照；缺失时仍保留 reviewerUserId。 */
+    private UserMapper userMapper;
     /** GitHub 合并属于慢速外部 IO，生产环境复用编排线程池异步执行。 */
     private Executor mergeExecutor;
     /**
@@ -102,6 +105,8 @@ public class MergeRequestService {
     /** 已确认创建真实 MR 后的群聊回卡依赖；发送失败不得改变远端 MR 事实。 */
     private MessageService messageService;
     private OrchestratorAgentService orchestratorAgents;
+    /** 需求群可见性复用任务中心规则，避免 MR 列表展示用户无法申请的分支。 */
+    private GroupService groupService;
     /** TASK_STATUS 卡片仓库映射；通知增强失败不得改变真实 MR 状态。 */
     private TaskStatusRepositoryContextService repositoryContextService;
 
@@ -133,6 +138,16 @@ public class MergeRequestService {
     @org.springframework.beans.factory.annotation.Autowired(required = false)
     void setRepositoryContextService(TaskStatusRepositoryContextService repositoryContextService) {
         this.repositoryContextService = repositoryContextService;
+    }
+
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    void setGroupService(GroupService groupService) {
+        this.groupService = groupService;
+    }
+
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    void setUserMapper(UserMapper userMapper) {
+        this.userMapper = userMapper;
     }
 
     @org.springframework.beans.factory.annotation.Autowired(required = false)
@@ -238,6 +253,14 @@ public class MergeRequestService {
                                                                        UUID groupId, String status, String cursor,
                                                                        int limit, String requestId) {
         projectAccess.requireProjectMember(projectId, userId);
+        boolean projectAdmin = projectAccess.isProjectAdmin(projectId, userId);
+        Set<UUID> visibleGroupIds = projectAdmin || groupService == null ? null : visibleGroupIds(projectId, userId);
+        if (!projectAdmin && groupService != null && visibleGroupIds.isEmpty()) {
+            return emptyPage(requestId);
+        }
+        if (!projectAdmin && groupService != null && groupId != null && !visibleGroupIds.contains(groupId)) {
+            return emptyPage(requestId);
+        }
         int size = clampLimit(limit);
         List<UUID> repoIds = projectRepositoryMapper.selectList(Wrappers.<ProjectRepositoryEntity>lambdaQuery()
                         .eq(ProjectRepositoryEntity::getProjectId, projectId)).stream()
@@ -249,7 +272,7 @@ public class MergeRequestService {
                 || "PENDING_CREATE".equalsIgnoreCase(status);
         List<MergeRequestSummaryResponse> pendingCandidates = includePendingCreate
                 ? placeholderMergeRequests(projectId, repositoryId, groupId,
-                "PENDING_CREATE".equalsIgnoreCase(status) ? null : "WAITING_PREFLIGHT")
+                "WAITING_PREFLIGHT", visibleGroupIds)
                 : List.of();
         Set<String> pendingIds = pendingCandidates.stream()
                 .map(MergeRequestSummaryResponse::getId).filter(Objects::nonNull).collect(Collectors.toSet());
@@ -257,6 +280,9 @@ public class MergeRequestService {
         boolean cursorIsPending = cursor != null && pendingIds.contains(cursor);
         QueryWrapper<MergeRequestEntity> query = Wrappers.<MergeRequestEntity>query()
                 .in("project_repository_id", repoIds)
+                // PENDING_CREATE is a transient projection built below. Older versions
+                // persisted those rows, so never let stale placeholders leak back as real MRs.
+                .ne("status", "PENDING_CREATE")
                 .eq(status != null && !status.isBlank(), "status", status)
                 .eq(repositoryId != null, "project_repository_id", repositoryId)
                 // While paging through synthetic pending rows, do not apply the synthetic UUID
@@ -273,6 +299,15 @@ public class MergeRequestService {
             } else {
                 query.in("id", mrIds);
             }
+        }
+        if (!projectAdmin && groupService != null) {
+            List<UUID> visibleTaskIds = visibleTaskIds(projectId, visibleGroupIds);
+            query.and(wrapper -> {
+                wrapper.isNull("task_id");
+                if (!visibleTaskIds.isEmpty()) {
+                    wrapper.or().in("task_id", visibleTaskIds);
+                }
+            });
         }
         List<MergeRequestEntity> rows = mergeRequestMapper.selectList(query);
         if (rows == null) rows = List.of();
@@ -471,6 +506,10 @@ public class MergeRequestService {
             throw new ApiException(HttpStatus.CONFLICT, "MR_BRANCH_LOCKED_BY_OPEN_MR",
                     "该工作分支已有未合并的 MR，不能继续推送新的提交",
                     List.of(branchLockDetails(existing)));
+        }
+        if (existing == null && sameCommit(worktree.getHeadCommit(), targetCommit)) {
+            throw new ApiException(HttpStatus.CONFLICT, "MR_NO_CHANGES",
+                    "源分支与目标分支当前提交相同，没有可创建 MR 的变更");
         }
         if (!completedReplayCandidate) {
             requirePreflightGates().requireReady(task, worktree, request.getRepositoryId(), request.getTargetBranch(), targetCommit);
@@ -1059,6 +1098,9 @@ public class MergeRequestService {
                               boolean alreadyInProgress) {
     }
 
+    private record RemoteStateUpdate(MergeRequestEntity mergeRequest, boolean changed) {
+    }
+
     /**
      * 查询门禁检查汇总（契约 §21：包装为 {status, requiredChecks, items[]}）。
      */
@@ -1084,6 +1126,24 @@ public class MergeRequestService {
     }
 
     /**
+     * 查询 GitHub Pull Request 的真实提交记录。
+     */
+    public MergeRequestCommitListResponse commits(UUID projectId, UUID mergeRequestId, UUID userId, int limit) {
+        projectAccess.requireProjectMember(projectId, userId);
+        MergeRequestEntity mr = requireMr(projectId, mergeRequestId);
+        GitHubRepositoryEntity githubRepository = requireGitHubRepository(projectId, mr.getProjectRepositoryId());
+        GitHubInstallationEntity installation = requireInstallation(githubRepository);
+        int effectiveLimit = requireCommitLimit(limit);
+        GitHubPullRequestCommitList commits = githubClient.getPullRequestCommits(
+                installation.getProviderInstallationId(), githubRepository.getOwnerLogin(), githubRepository.getName(),
+                requireProviderNumber(mr), effectiveLimit);
+        return new MergeRequestCommitListResponse(commits.totalCount(), commits.items().stream()
+                .map(commit -> new MergeRequestCommitResponse(commit.sha(), commit.message(), commit.authorName(),
+                        commit.authorUserId(), commit.committedAt()))
+                .toList());
+    }
+
+    /**
      * Refreshes the local mirror from GitHub's current Pull Request state.
      */
     public MergeRequestSummaryResponse sync(UUID projectId, UUID mergeRequestId, UUID userId) {
@@ -1093,8 +1153,11 @@ public class MergeRequestService {
         GitHubInstallationEntity installation = requireInstallation(githubRepository);
         GitHubPullRequestDetails remote = githubClient.getPullRequest(installation.getProviderInstallationId(),
                 githubRepository.getOwnerLogin(), githubRepository.getName(), requireProviderNumber(mr));
-        mr = inTransaction(() -> persistRemoteState(projectId, mergeRequestId, remote));
-        publishUpdated(mr);
+        RemoteStateUpdate update = inTransaction(() -> persistRemoteState(projectId, mergeRequestId, remote));
+        mr = update.mergeRequest();
+        if (update.changed()) {
+            publishUpdated(mr);
+        }
         return toSummary(mr, groupIdsByMr(List.of(mr)).getOrDefault(mr.getId(), List.of()), qualityGate(mr),
                 mrWebUrl(mr));
     }
@@ -1114,6 +1177,7 @@ public class MergeRequestService {
         review.setMergeRequestId(mr.getId());
         review.setReviewKind("HUMAN");
         review.setReviewerUserId(userId);
+        review.setReviewerName(reviewerName(userId));
         review.setDecision("APPROVED");
         review.setSummary(reason);
         review.setReviewedAt(now);
@@ -1138,7 +1202,19 @@ public class MergeRequestService {
         if (reason == null || reason.isBlank()) {
             throw new ApiException(HttpStatus.BAD_REQUEST, "CQ_REJECTION_REASON_REQUIRED", "拒绝 CQ 必须给出修改意见");
         }
-        writeCheck(mr, "CQ_PLUS_ONE", "FAILED", "cq_rejection", reason, LocalDateTime.now(ZoneOffset.UTC));
+        LocalDateTime now = LocalDateTime.now(ZoneOffset.UTC);
+        MergeRequestReviewEntity review = new MergeRequestReviewEntity();
+        review.setId(UuidV7.next());
+        review.setMergeRequestId(mr.getId());
+        review.setReviewKind("HUMAN");
+        review.setReviewerUserId(userId);
+        review.setReviewerName(reviewerName(userId));
+        review.setDecision("REJECTED");
+        review.setSummary(reason);
+        review.setReviewedAt(now);
+        review.setCreatedAt(now);
+        reviewMapper.insert(review);
+        writeCheck(mr, "CQ_PLUS_ONE", "FAILED", "cq_rejection", reason, now);
         refreshQualityGate(mr);
         publishUpdated(mr);
         return toSummary(mr, groupIdsByMr(List.of(mr)).getOrDefault(mr.getId(), List.of()), qualityGate(mr),
@@ -1150,18 +1226,29 @@ public class MergeRequestService {
      * 测试环境未注入执行器时保留同步执行，便于维持服务层单元测试的确定性。
      */
     public MergeRequestSummaryResponse merge(UUID projectId, UUID mergeRequestId, UUID userId) {
+        return merge(projectId, mergeRequestId, userId, null);
+    }
+
+    /**
+     * 受理 GitHub 合并，可选传入 squash 合并提交说明。
+     */
+    public MergeRequestSummaryResponse merge(UUID projectId, UUID mergeRequestId, UUID userId,
+                                             String commitMessage) {
         projectAccess.requireProjectAdmin(projectId, userId);
+        String normalizedCommitMessage = normalizeCommitMessage(commitMessage);
         MergeClaim claim = inTransaction(() -> claimMerge(projectId, mergeRequestId));
         if (claim.alreadyCompleted() || claim.alreadyInProgress()) {
             return summary(claim.mergeRequest());
         }
         boolean synchronous = mergeExecutor == null;
-        Runnable operation = () -> executeMerge(projectId, mergeRequestId, claim, synchronous);
+        Runnable operation = () -> executeMerge(projectId, mergeRequestId, claim, synchronous,
+                normalizedCommitMessage);
         if (mergeExecutor != null) {
             try {
                 mergeExecutor.execute(operation);
             } catch (RejectedExecutionException rejected) {
-                inTransaction(() -> failMerge(mergeRequestId, claim.operationId()));
+                inTransaction(() -> failMerge(mergeRequestId, claim.operationId(),
+                        "MERGE_EXECUTOR_UNAVAILABLE", "合并任务当前排队已满，请稍后重试"));
                 throw new ApiException(HttpStatus.SERVICE_UNAVAILABLE, "MERGE_EXECUTOR_UNAVAILABLE",
                         "合并任务当前排队已满，请稍后重试");
             }
@@ -1171,7 +1258,8 @@ public class MergeRequestService {
         return summary(inTransaction(() -> mergeRequestMapper.selectById(mergeRequestId)));
     }
 
-    private void executeMerge(UUID projectId, UUID mergeRequestId, MergeClaim claim, boolean propagateFailure) {
+    private void executeMerge(UUID projectId, UUID mergeRequestId, MergeClaim claim, boolean propagateFailure,
+                              String commitMessage) {
         try {
             GitHubPullRequestDetails remote = githubClient.getPullRequest(
                     claim.installation().getProviderInstallationId(), claim.githubRepository().getOwnerLogin(),
@@ -1189,7 +1277,7 @@ public class MergeRequestService {
                         new GitHubPullRequestMergeRequest(
                                 "Merge " + (claim.mergeRequest().getTitle() == null
                                         ? "Pull Request" : claim.mergeRequest().getTitle()),
-                                null, "squash", claim.mergeRequest().getHeadCommit()));
+                                commitMessage, "squash", claim.mergeRequest().getHeadCommit()));
                 if (!result.merged()) {
                     throw new ApiException(HttpStatus.CONFLICT, "GITHUB_MERGE_NOT_COMPLETED",
                             result.message() == null ? "GitHub did not merge the Pull Request" : result.message());
@@ -1199,7 +1287,11 @@ public class MergeRequestService {
                     claim.operationId()));
             publishUpdated(merged);
         } catch (RuntimeException failure) {
-            MergeRequestEntity failed = inTransaction(() -> failMerge(mergeRequestId, claim.operationId()));
+            String failureCode = failure instanceof ApiException api ? api.code() : "GITHUB_MERGE_FAILED";
+            String failureReason = failure instanceof ApiException api
+                    ? api.getMessage() : "GitHub 合并失败，请稍后重试";
+            MergeRequestEntity failed = inTransaction(() -> failMerge(mergeRequestId, claim.operationId(),
+                    failureCode, failureReason));
             if (failed != null) {
                 publishUpdated(failed);
             }
@@ -1243,6 +1335,8 @@ public class MergeRequestService {
         }
         mr.setMergeOperationId(operationId);
         mr.setMergeOperationStatus("RUNNING");
+        mr.setMergeOperationFailureCode(null);
+        mr.setMergeOperationFailureReason(null);
         mr.setMergeLeaseExpiresAt(now.plus(MERGE_OPERATION_LEASE));
         mergeRequestMapper.updateById(mr);
         return new MergeClaim(mr, githubRepository, installation, operationId, false, false);
@@ -1260,6 +1354,8 @@ public class MergeRequestService {
         LocalDateTime now = LocalDateTime.now(ZoneOffset.UTC);
         current.setStatus("MERGED");
         current.setMergeOperationStatus("COMPLETED");
+        current.setMergeOperationFailureCode(null);
+        current.setMergeOperationFailureReason(null);
         current.setMergeLeaseExpiresAt(null);
         current.setProviderUpdatedAt(now);
         current.setSyncedAt(now);
@@ -1267,13 +1363,17 @@ public class MergeRequestService {
         return current;
     }
 
-    private MergeRequestEntity failMerge(UUID mergeRequestId, String operationId) {
+    private MergeRequestEntity failMerge(UUID mergeRequestId, String operationId,
+                                         String failureCode, String failureReason) {
         MergeRequestEntity current = mergeRequestMapper.selectByIdForUpdate(mergeRequestId);
         if (current == null || !operationId.equals(current.getMergeOperationId())
                 || "COMPLETED".equals(current.getMergeOperationStatus())) {
             return current;
         }
         current.setMergeOperationStatus("FAILED");
+        current.setMergeOperationFailureCode(failureCode);
+        current.setMergeOperationFailureReason(failureReason == null || failureReason.isBlank()
+                ? "合并失败，请稍后重试" : failureReason.substring(0, Math.min(failureReason.length(), 500)));
         current.setMergeLeaseExpiresAt(null);
         mergeRequestMapper.updateById(current);
         return current;
@@ -1281,8 +1381,8 @@ public class MergeRequestService {
 
     // ---------- 私有辅助 ----------
 
-    private MergeRequestEntity persistRemoteState(UUID projectId, UUID mergeRequestId,
-                                                  GitHubPullRequestDetails remote) {
+    private RemoteStateUpdate persistRemoteState(UUID projectId, UUID mergeRequestId,
+                                                 GitHubPullRequestDetails remote) {
         MergeRequestEntity current = mergeRequestMapper.selectByIdForUpdate(mergeRequestId);
         if (current == null) {
             throw new ApiException(HttpStatus.NOT_FOUND, "MERGE_REQUEST_NOT_FOUND", "MR 不存在或不可见");
@@ -1291,24 +1391,38 @@ public class MergeRequestService {
         if (repository == null || !projectId.equals(repository.getProjectId())) {
             throw new ApiException(HttpStatus.NOT_FOUND, "MERGE_REQUEST_NOT_FOUND", "MR 不存在或不可见");
         }
-        LocalDateTime now = LocalDateTime.now(ZoneOffset.UTC);
-        current.setProviderNumber((long) remote.number());
-        current.setSourceBranch(remote.headBranch());
-        current.setTargetBranch(remote.baseBranch());
-        current.setHeadCommit(remote.headSha());
-        if (remote.title() != null) current.setTitle(remote.title());
         // 较早发起的同步请求不得把已经落库的 MERGED 终态覆盖回 OPEN。
-        if (!"MERGED".equals(current.getStatus()) || remote.merged()) {
-            current.setStatus(toLocalStatus(remote));
+        String nextStatus = ("MERGED".equals(current.getStatus()) && !remote.merged())
+                ? current.getStatus() : toLocalStatus(remote);
+        boolean remoteChanged = current.getProviderNumber() == null
+                || current.getProviderNumber().longValue() != remote.number()
+                || !Objects.equals(current.getSourceBranch(), remote.headBranch())
+                || !Objects.equals(current.getTargetBranch(), remote.baseBranch())
+                || !Objects.equals(current.getHeadCommit(), remote.headSha())
+                || (remote.title() != null && !Objects.equals(current.getTitle(), remote.title()))
+                || !Objects.equals(current.getStatus(), nextStatus)
+                || !Objects.equals(current.getMergeable(), remote.mergeable())
+                || !Objects.equals(current.getMergeableState(), remote.mergeableState())
+                || !Objects.equals(current.getBaseSha(), remote.baseSha());
+        if (remoteChanged) {
+            LocalDateTime now = LocalDateTime.now(ZoneOffset.UTC);
+            current.setProviderNumber((long) remote.number());
+            current.setSourceBranch(remote.headBranch());
+            current.setTargetBranch(remote.baseBranch());
+            current.setHeadCommit(remote.headSha());
+            if (remote.title() != null) current.setTitle(remote.title());
+            current.setStatus(nextStatus);
+            current.setProviderUpdatedAt(now);
+            current.setSyncedAt(now);
+            current.setMergeable(remote.mergeable());
+            current.setMergeableState(remote.mergeableState());
+            current.setBaseSha(remote.baseSha());
+            mergeRequestMapper.updateById(current);
         }
-        current.setProviderUpdatedAt(now);
-        current.setSyncedAt(now);
-        current.setMergeable(remote.mergeable());
-        current.setMergeableState(remote.mergeableState());
-        current.setBaseSha(remote.baseSha());
-        mergeRequestMapper.updateById(current);
+        String previousQualityGateStatus = current.getQualityGateStatus();
         refreshQualityGate(current);
-        return current;
+        return new RemoteStateUpdate(current, remoteChanged
+                || !Objects.equals(previousQualityGateStatus, current.getQualityGateStatus()));
     }
 
     /**
@@ -1336,9 +1450,11 @@ public class MergeRequestService {
             if (remote == null || remote.mergeable() == null) {
                 continue;
             }
-            MergeRequestEntity updated = inTransaction(() -> persistRemoteState(projectId, mr.getId(), remote));
-            publishUpdated(updated);
-            return updated;
+            RemoteStateUpdate update = inTransaction(() -> persistRemoteState(projectId, mr.getId(), remote));
+            if (update.changed()) {
+                publishUpdated(update.mergeRequest());
+            }
+            return update.mergeRequest();
         }
         return mr;
     }
@@ -1698,9 +1814,9 @@ public class MergeRequestService {
         if (task == null) {
             return;
         }
-        notificationService.notify(task.getCreatedBy(), projectId, task.getRequirementGroupId(), "MR_PENDING",
+        notificationService.notifyMrStatus(task.getCreatedBy(), projectId, task.getRequirementGroupId(),
                 "MR 状态更新：" + (mr.getTitle() == null || mr.getTitle().isBlank() ? mr.getProviderNumber() : mr.getTitle()),
-                mr.getStatus(), mr.getId().toString());
+                mr.getStatus(), mr.getId().toString(), mr.getStatus());
     }
 
     /**
@@ -1773,7 +1889,8 @@ public class MergeRequestService {
      */
     private List<MergeRequestSummaryResponse> placeholderMergeRequests(UUID projectId, UUID repositoryId,
                                                                         UUID requirementGroupId,
-                                                                        String taskRequiredStatus) {
+                                                                        String taskRequiredStatus,
+                                                                        Set<UUID> visibleGroupIds) {
         List<WorkspaceRepositoryEntity> worktrees = workspaceRepositoryMapper.selectByProject(projectId, repositoryId);
         if (worktrees == null || worktrees.isEmpty()) {
             return List.of();
@@ -1787,8 +1904,12 @@ public class MergeRequestService {
         QueryWrapper<TaskEntity> taskQuery = Wrappers.<TaskEntity>query()
                 .eq("project_id", projectId).in("workspace_id", workspaceIds)
                 .eq(requirementGroupId != null, "requirement_group_id", requirementGroupId);
-        // 默认列表同时展示仍在等待预检的 MR_FIRST 任务，以及已经完成交付但尚未
-        // 落库真实 MR 的 DIFF_FIRST 小任务。PENDING_CREATE 查询则保持原语义：不限制 Task 状态。
+        if (visibleGroupIds != null) {
+            if (visibleGroupIds.isEmpty()) return List.of();
+            taskQuery.in("requirement_group_id", visibleGroupIds);
+        }
+        // 待创建占位只代表已经完成交付、可以进入 MR 前门禁的任务。
+        // 默认列表和显式 PENDING_CREATE 查询都必须排除仍在开发/等待交付确认的 Task。
         if ("WAITING_PREFLIGHT".equalsIgnoreCase(taskRequiredStatus)) {
             taskQuery.and(wrapper -> wrapper.eq("status", "WAITING_PREFLIGHT")
                     .or().eq("status", "SUCCEEDED"));
@@ -1797,16 +1918,37 @@ public class MergeRequestService {
         }
         List<TaskEntity> tasks = taskMapper.selectList(taskQuery);
         if (tasks == null) tasks = List.of();
-        Map<UUID, TaskEntity> taskByWorkspace = new HashMap<>();
+        Map<UUID, TaskEntity> taskById = new HashMap<>();
         for (TaskEntity task : tasks) {
             if (task == null || task.getWorkspaceId() == null) continue;
             if (!matchesPlaceholderTaskStatus(taskRequiredStatus, task.getStatus())) continue;
             if (requirementGroupId != null && !requirementGroupId.equals(task.getRequirementGroupId())) continue;
-            taskByWorkspace.merge(task.getWorkspaceId(), task, this::newerTask);
+            if (task.getId() != null) taskById.put(task.getId(), task);
         }
-        if (taskByWorkspace.isEmpty()) {
+        if (taskById.isEmpty()) {
             return List.of();
         }
+
+        // A Workspace is provisioned with every project repository, but a Task's AI
+        // changes only the repositories it actually touched. Use delivered Diff rows
+        // as the repository-level evidence instead of applying the newest Task to every
+        // worktree in the Workspace.
+        List<DiffEntity> deliveredDiffs = diffMapper == null
+                ? List.of()
+                : diffMapper.selectList(Wrappers.<DiffEntity>lambdaQuery()
+                .eq(DiffEntity::getProjectId, projectId)
+                .in(DiffEntity::getTaskId, taskById.keySet())
+                .eq(DiffEntity::getStatus, "ACCEPTED")
+                .in(DiffEntity::getDeliveryStatus, "PUSHED", "MR_CREATED"));
+        if (deliveredDiffs == null || deliveredDiffs.isEmpty()) {
+            return List.of();
+        }
+        Set<String> deliveredTaskRepositoryKeys = deliveredDiffs.stream()
+                .filter(Objects::nonNull)
+                .filter(diff -> diff.getTaskId() != null && diff.getProjectRepositoryId() != null)
+                .map(diff -> diff.getTaskId() + "|" + diff.getProjectRepositoryId()
+                        + "|" + (diff.getSourceBranch() == null ? "" : diff.getSourceBranch()))
+                .collect(Collectors.toSet());
 
         Set<UUID> projectRepositoryIds = worktrees.stream().map(WorkspaceRepositoryEntity::getProjectRepositoryId)
                 .filter(Objects::nonNull).collect(Collectors.toSet());
@@ -1816,6 +1958,7 @@ public class MergeRequestService {
         List<MergeRequestEntity> existing = mergeRequestMapper.selectList(
                 Wrappers.<MergeRequestEntity>query()
                         .in("project_repository_id", projectRepositoryIds)
+                        .ne("status", "PENDING_CREATE")
                         .ne("status", "MERGED")
                         .ne("status", "CLOSED"));
         if (existing == null) existing = List.of();
@@ -1831,10 +1974,24 @@ public class MergeRequestService {
                 .collect(Collectors.toMap(ProjectRepositoryEntity::getId, Function.identity(), (left, right) -> left));
         Map<String, PlaceholderCandidate> candidatesByBranch = new HashMap<>();
         for (WorkspaceRepositoryEntity worktree : worktrees) {
-            TaskEntity task = taskByWorkspace.get(worktree.getWorkspaceId());
-            if (task == null || worktree.getProjectRepositoryId() == null
+            if (worktree.getProjectRepositoryId() == null
                     || worktree.getSourceBranch() == null || worktree.getSourceBranch().isBlank()
                     || worktree.getHeadCommit() == null || worktree.getHeadCommit().isBlank()) {
+                continue;
+            }
+            // 工作树 HEAD 仍停留在创建时的基线提交时，源分支没有可创建 MR 的新增变更。
+            // 这种记录可能因任务已进入 WAITING_PREFLIGHT/SUCCEEDED 而存在，但不能注入
+            // PENDING_CREATE 占位，否则前端会展示一个永远无法创建的 MR 候选。
+            if (sameCommit(worktree.getHeadCommit(), worktree.getBaseCommit())) {
+                continue;
+            }
+            TaskEntity task = taskById.values().stream()
+                    .filter(candidate -> Objects.equals(candidate.getWorkspaceId(), worktree.getWorkspaceId()))
+                    .filter(candidate -> deliveredTaskRepositoryKeys.contains(candidate.getId() + "|"
+                            + worktree.getProjectRepositoryId() + "|" + worktree.getSourceBranch()))
+                    .max(this::compareTasksForPlaceholder)
+                    .orElse(null);
+            if (task == null) {
                 continue;
             }
             String key = branchKey(worktree.getProjectRepositoryId(), worktree.getSourceBranch());
@@ -1882,6 +2039,35 @@ public class MergeRequestService {
         result.sort(Comparator.comparing(MergeRequestSummaryResponse::getId,
                 Comparator.nullsLast(Comparator.reverseOrder())));
         return result;
+    }
+
+    private String normalizeCommitMessage(String commitMessage) {
+        if (commitMessage == null || commitMessage.isBlank()) {
+            return null;
+        }
+        String normalized = commitMessage.trim();
+        if (normalized.length() > 500) {
+            throw new ApiException(HttpStatus.BAD_REQUEST, "MERGE_COMMIT_MESSAGE_TOO_LONG",
+                    "合并提交说明不能超过 500 个字符");
+        }
+        return normalized;
+    }
+
+    private Set<UUID> visibleGroupIds(UUID projectId, UUID userId) {
+        if (groupService == null) {
+            return Set.of();
+        }
+        return new HashSet<>(groupService.visibleGroupIds(projectId, userId));
+    }
+
+    private List<UUID> visibleTaskIds(UUID projectId, Set<UUID> visibleGroupIds) {
+        if (visibleGroupIds == null || visibleGroupIds.isEmpty()) {
+            return List.of();
+        }
+        return taskMapper.selectList(Wrappers.<TaskEntity>query()
+                        .eq("project_id", projectId)
+                        .in("requirement_group_id", visibleGroupIds))
+                .stream().map(TaskEntity::getId).filter(Objects::nonNull).toList();
     }
 
     private PlaceholderCandidate newerPlaceholderCandidate(PlaceholderCandidate left,
@@ -1958,19 +2144,21 @@ public class MergeRequestService {
 
     private record PlaceholderCandidate(TaskEntity task, WorkspaceRepositoryEntity worktree) { }
 
-    private TaskEntity newerTask(TaskEntity left, TaskEntity right) {
-        LocalDateTime leftTime = left.getUpdatedAt() == null ? left.getCreatedAt() : left.getUpdatedAt();
-        LocalDateTime rightTime = right.getUpdatedAt() == null ? right.getCreatedAt() : right.getUpdatedAt();
-        if (leftTime == null) return right;
-        if (rightTime == null) return left;
-        if (rightTime.isAfter(leftTime)) return right;
-        if (rightTime.equals(leftTime) && right.getId() != null && left.getId() != null
-                && right.getId().compareTo(left.getId()) > 0) return right;
-        return left;
+    private int compareTasksForPlaceholder(TaskEntity left, TaskEntity right) {
+        TaskEntity newer = newerPlaceholderTask(left, right);
+        return newer == right ? -1 : newer == left ? 1 : 0;
     }
 
     private String branchKey(UUID repositoryId, String sourceBranch) {
         return repositoryId + "|" + sourceBranch;
+    }
+
+    private String reviewerName(UUID userId) {
+        if (userMapper == null || userId == null) {
+            return null;
+        }
+        UserEntity user = userMapper.selectById(userId);
+        return user == null ? null : user.getDisplayName();
     }
 
     private String placeholderMrId(UUID taskId, UUID repositoryId) {
@@ -1999,6 +2187,8 @@ public class MergeRequestService {
         response.setTargetBranch(mr.getTargetBranch());
         response.setStatus(mr.getStatus());
         response.setMergeOperationStatus(mr.getMergeOperationStatus());
+        response.setMergeOperationFailureCode(mr.getMergeOperationFailureCode());
+        response.setMergeOperationFailureReason(mr.getMergeOperationFailureReason());
         response.setHeadCommit(mr.getHeadCommit());
         response.setMergeable(mr.getMergeable());
         response.setMergeableState(mr.getMergeableState());
@@ -2057,6 +2247,13 @@ public class MergeRequestService {
             return DEFAULT_LIMIT;
         }
         return Math.min(limit, MAX_LIMIT);
+    }
+
+    private int requireCommitLimit(int limit) {
+        if (limit < 1 || limit > MAX_LIMIT) {
+            throw new ApiException(HttpStatus.BAD_REQUEST, "INVALID_LIMIT", "limit 必须在 1 到 100 之间");
+        }
+        return limit;
     }
 
     private String iso(LocalDateTime time) {

@@ -187,6 +187,9 @@ public class TaskOrchestrator {
             if (startStepId != null && "FAILED".equals(task.getStatus())) {
                 notificationService.clearTaskFailedNotifications(taskId.toString());
             }
+            // claim SQL 已把数据库状态推进到 RUNNING；同步内存对象，后续步骤状态卡片不能
+            // 再使用入口时读到的 PLANNING/PENDING/FAILED 旧值。
+            task.setStatus("RUNNING");
         }
         TaskExecutionContext ctx = new TaskExecutionContext(task);
         // 续跑来源：首个 TaskRun 的 retryOfTaskRunId 指向被重试的失败运行
@@ -201,7 +204,14 @@ public class TaskOrchestrator {
         // 双持同一 workspace session、输家 finally release 销毁赢家正在用的沙箱。
         TaskExecutionContext previous = executions.putIfAbsent(taskId, ctx);
         if (previous != null) {
-            throw new IllegalStateException("Task " + taskId + " is already being orchestrated in this process");
+            // 恢复器只会在任务长期无活跃 Run 时续跑；若本进程仍保留旧上下文且尚未创建 Run，
+            // 说明旧线程卡在 Sandbox 初始化等启动窗口。不能只把异常交给异步监听器吞掉，
+            // 否则任务会永久 RUNNING；已有 Run 时保留原执行者继续收敛，避免误判并发执行。
+            if (previous.activeRunId == null) {
+                failStartup(task, previous, new IllegalStateException(
+                        "Task " + taskId + " is already being orchestrated in this process"));
+            }
+            return;
         }
         try {
             // 先物化 Planner 步骤再获取 Sandbox。这样即使 Sandbox/Worker 在规划调用前失败，
@@ -210,6 +220,12 @@ public class TaskOrchestrator {
                 planMaterialization.ensurePlannerStep(task);
             }
             sandboxSessionManager.acquire(task.getId(), task.getProjectId(), task.getWorkspaceId());
+            // 恢复器可能已将同一启动上下文收敛为 FAILED；旧初始化线程即使晚返回，也不得
+            // 再进入 Planner/正式图或创建 Sandbox 后继续修改 Workspace。
+            if (ctx.aborted) {
+                log.info("orchestration startup context aborted before graph taskId={}", taskId);
+                return;
+            }
             // 群聊/Skill/Memory 上下文快照：一次 orchestrate 组装一次，跨节点复用（失败不阻断）
             ctx.groupContext = contextAssembler.buildGroupContext(task);
             TaskEntity current = taskMapper.selectById(taskId);
@@ -232,6 +248,8 @@ public class TaskOrchestrator {
                     log.info("orchestrate plan claimed by concurrent executor, skip taskId={}", taskId);
                     return;
                 }
+                // 认领 SQL 不回填实体对象；步骤开始卡片使用该对象，因此必须同步为 RUNNING。
+                task.setStatus("RUNNING");
                 publishTaskRunningEvent(taskId);
             }
             List<TaskStepEntity> steps = loadSteps(taskId).stream()
@@ -309,11 +327,14 @@ public class TaskOrchestrator {
         }
         while (true) {
             sendPlanningStartedCard(task);
+            ctx.activeStepId = planner.getId();
+            ctx.activeRunId = null;
             markStepRunning(task, planner);
             TaskRunEntity run = taskRunService.createForStep(task.getProjectId(), task.getId(), planner.getId(),
                     planner.getRole(), planner.getAssignedAgentId(), task.getCreatedBy(), ctx.retryOf);
-            taskRunService.markRunning(run.getId());
+            ctx.activeRunId = run.getId();
             ctx.lastRunId = run.getId();
+            taskRunService.markRunning(run.getId());
             // 规划期心跳：刷新任务 updated_at，防止恢复调度器把长规划任务误判为卡死续跑
             taskMapper.touchUpdatedAt(task.getId());
             AgentInput input = contextAssembler.assemble(task, planner, OrchestrationPhase.PLAN,
@@ -325,7 +346,7 @@ public class TaskOrchestrator {
                 ctx.planResult = outcome.getPlanResult();
             }
             StateMachineDecision decision = stateMachine.decide(OrchestrationPhase.PLAN, outcome.getOutcome(),
-                    ctx.counters);
+                    outcome.getFailureCode(), ctx.counters);
             ctx.recordOutcome(planner.getId(), OrchestrationPhase.PLAN, outcome);
             if (decision.getAction() == StateMachineDecision.Action.ADVANCE && outcome.getPlanResult() != null) {
                 try {
@@ -382,6 +403,9 @@ public class TaskOrchestrator {
      * （落库 + task.updated 事件 + TASK_FAILED 通知）并以编排助手身份回群失败卡片。
      */
     private void failStartup(TaskEntity task, TaskExecutionContext ctx, RuntimeException cause) {
+        if (ctx != null) {
+            ctx.aborted = true;
+        }
         log.error("orchestration aborted by unexpected failure, taskId={} exceptionType={} detail={}", task.getId(),
                 cause.getClass().getSimpleName(), ExecutionContentSanitizer.sanitizeDiagnosticDetail(cause.getMessage()));
         TaskEntity latest = taskMapper.selectById(task.getId());
@@ -393,13 +417,20 @@ public class TaskOrchestrator {
         StartupFailure failure = startupFailure(cause);
         AgentRunOutcome startupOutcome = infrastructureFailure(OrchestrationPhase.PLAN, failure.reason(), failure.code(),
                 "ORCHESTRATOR_STARTUP", cause);
-        // Sandbox 获取、上下文组装等异常可能发生在 Planner 调用前。仍然创建一条失败的
-        // Planner Run，保证 diagnostics 能通过 latestFailedRun 返回可追踪的根因。
-        if (ctx != null && ctx.lastRunId != null) {
+        // Step 在 TaskRun 创建前已被置为 RUNNING。此处必须跟踪本次节点，不能用前一条已成功的
+        // lastRunId 代替，否则 createForStep/markRunning 失败会遗留 RUNNING Step。
+        TaskStepEntity activeStep = ctx == null || ctx.activeStepId == null
+                ? null : stepMapper.selectById(ctx.activeStepId);
+        TaskRunEntity activeRun = ctx == null || ctx.activeRunId == null
+                ? null : taskRunService.findById(ctx.activeRunId);
+        if (activeRun != null) {
+            settleUnexpectedFailureRun(task, activeRun, activeStep, startupOutcome, failure);
+        } else if (activeStep != null) {
+            createStartupFailureRun(task, ctx, activeStep, startupOutcome, failure);
+        } else if (ctx != null && ctx.lastRunId != null) {
             TaskRunEntity run = taskRunService.findById(ctx.lastRunId);
-            if (run != null && "RUNNING".equals(run.getStatus())) {
-                recordFailureDiagnostic(task, run, stepMapper.selectById(run.getTaskStepId()), startupOutcome);
-                taskRunService.complete(run.getId(), "FAILED", failure.code(), failure.reason());
+            if (run != null && ("QUEUED".equals(run.getStatus()) || "RUNNING".equals(run.getStatus()))) {
+                settleUnexpectedFailureRun(task, run, stepMapper.selectById(run.getTaskStepId()), startupOutcome, failure);
             }
         } else {
             // 续跑/重试时启动阶段失败（如 Sandbox 获取失败）发生在任何 step 节点执行之前，此时
@@ -417,15 +448,9 @@ public class TaskOrchestrator {
                         .last("LIMIT 1"));
                 step = plannerSteps == null || plannerSteps.isEmpty() ? null : plannerSteps.get(0);
             }
-            if (step != null) {
-                TaskRunEntity run = taskRunService.createForStep(task.getProjectId(), task.getId(), step.getId(),
-                        step.getRole(), step.getAssignedAgentId(), task.getCreatedBy(),
-                        ctx == null ? null : ctx.retryOf);
-                taskRunService.markRunning(run.getId());
-                recordFailureDiagnostic(task, run, step, startupOutcome);
-                taskRunService.complete(run.getId(), "FAILED", failure.code(), failure.reason());
-            }
+            if (step != null) createStartupFailureRun(task, ctx, step, startupOutcome, failure);
         }
+        markActiveStepFailed(task, activeStep);
         LocalDateTime now = LocalDateTime.now(ZoneOffset.UTC);
         String publicFailureCode = clientFailureCode(failure.code());
         latest.setFailureCode(publicFailureCode);
@@ -437,6 +462,43 @@ public class TaskOrchestrator {
         sendAgentCard(latest, "task-" + latest.getId(), "FAILED", null,
                 "任务启动失败：" + failure.title() + "。" + failure.reason()
                         + (failure.retryable() ? "，可以稍后重试" : "，请先修复配置后重试"));
+    }
+
+    /** 为节点启动异常补写失败 Run；补写自身失败时仍必须继续收敛 Task 与 Step。 */
+    private void createStartupFailureRun(TaskEntity task, TaskExecutionContext ctx, TaskStepEntity step,
+                                         AgentRunOutcome outcome, StartupFailure failure) {
+        try {
+            TaskRunEntity run = taskRunService.createForStep(task.getProjectId(), task.getId(), step.getId(),
+                    step.getRole(), step.getAssignedAgentId(), task.getCreatedBy(), ctx == null ? null : ctx.retryOf);
+            if (ctx != null) {
+                ctx.activeRunId = run.getId();
+                ctx.lastRunId = run.getId();
+            }
+            taskRunService.markRunning(run.getId());
+            settleUnexpectedFailureRun(task, run, step, outcome, failure);
+        } catch (RuntimeException diagnosticFailure) {
+            log.warn("startup failure run could not be persisted taskId={} stepId={} exceptionType={}", task.getId(),
+                    step.getId(), diagnosticFailure.getClass().getSimpleName());
+        }
+    }
+
+    /** 将已创建但尚未完成的当前 Run 收敛为 FAILED，覆盖 QUEUED 与 RUNNING 两种异常窗口。 */
+    private void settleUnexpectedFailureRun(TaskEntity task, TaskRunEntity run, TaskStepEntity step,
+                                            AgentRunOutcome outcome, StartupFailure failure) {
+        try {
+            if (step != null) recordFailureDiagnostic(task, run, step, outcome);
+            taskRunService.failIfActive(run.getId(), failure.code());
+        } catch (RuntimeException settlementFailure) {
+            log.warn("startup failure run settlement skipped taskId={} runId={} exceptionType={}", task.getId(),
+                    run.getId(), settlementFailure.getClass().getSimpleName());
+        }
+    }
+
+    /** 当前 Step 已写入 RUNNING 时，任务失败必须同步收敛该 Step，避免前端继续展示执行中。 */
+    private void markActiveStepFailed(TaskEntity task, TaskStepEntity step) {
+        if (step != null && ("RUNNING".equals(step.getStatus()) || "PENDING".equals(step.getStatus()))) {
+            markStepSettled(task, step, RunOutcome.FAILED);
+        }
     }
 
     /**
@@ -569,6 +631,15 @@ public class TaskOrchestrator {
     private Map<String, Object> runStepNode(TaskStepEntity stepTemplate, TaskOrchestrationState state) {
         TaskExecutionContext ctx = executions.get(state.getTaskId());
         TaskEntity task = ctx.task;
+        // 任务已经由恢复器、取消操作或其他编排器收敛后，旧图不得再创建后续 Run。
+        // 尤其是 Review 可能在旧线程中迟到返回；终态检查必须发生在 markStepRunning 之前。
+        TaskEntity latestTask = taskMapper.selectById(task.getId());
+        if (latestTask == null || !STARTABLE_TASK_STATUSES.contains(latestTask.getStatus())) {
+            ctx.aborted = true;
+            log.info("skip step for non-startable task taskId={} stepId={} status={}", task.getId(),
+                    stepTemplate.getId(), latestTask == null ? "MISSING" : latestTask.getStatus());
+            return routeState(state, GraphDefinition.END);
+        }
         TaskStepEntity step = stepMapper.selectById(stepTemplate.getId());
         if (step == null) {
             log.warn("STEP_MISSING taskId={} stepId={}", task.getId(), stepTemplate.getId());
@@ -588,9 +659,13 @@ public class TaskOrchestrator {
             ctx.retryOf = null;
             return routeState(state, "next");
         }
+        ctx.activeStepId = step.getId();
+        ctx.activeRunId = null;
         markStepRunning(task, step);
         TaskRunEntity run = taskRunService.createForStep(task.getProjectId(), task.getId(), step.getId(),
                 step.getRole(), step.getAssignedAgentId(), task.getCreatedBy(), ctx.retryOf);
+        ctx.activeRunId = run.getId();
+        ctx.lastRunId = run.getId();
         taskRunService.markRunning(run.getId());
         AgentRunOutcome feedback = ctx.feedbackFor(step.getId());
         AgentInput input = contextAssembler.assemble(task, step, phase, feedback, run.getId(), ctx.planResult,
@@ -599,7 +674,6 @@ public class TaskOrchestrator {
         for (WorkerToolExecution execution : WorkerExecutionTraceContext.drain(run.getId())) {
             taskRunService.appendWorkerToolExecution(run, execution);
         }
-        ctx.lastRunId = run.getId();
         if (phase == OrchestrationPhase.CODING && outcome.getOutcome() == RunOutcome.SUCCEEDED) {
             ctx.lastCodingRunId = run.getId();
         }
@@ -619,7 +693,37 @@ public class TaskOrchestrator {
         // 先做纯状态机决策，再持久化本次 Run。这样 FAILED_QUALITY 仍保持真实失败事实，
         // 同时可把“已进入修复闭环”明确写入用户可见的 Run 消息，避免前端把单次 Run 失败
         // 误解为 Task 已经终止。
-        StateMachineDecision decision = stateMachine.decide(phase, outcome.getOutcome(), ctx.counters);
+        StateMachineDecision decision = stateMachine.decide(phase, outcome.getOutcome(), outcome.getFailureCode(),
+                ctx.counters);
+        // TESTING 本次真实执行成功 → 测试证据已具备，清除此前「测试未执行」的放行标记：基础设施恢复后
+        // 终态不能再引用已失效的旧测试失败事实（典型路径：TESTING 基础设施耗尽放行 → Review 判可修
+        // → Coding 修复 → 再测成功）。Review 放行标记只在 TESTING 之后才产生并收敛任务，不会被此误伤。
+        if (phase == OrchestrationPhase.TESTING && outcome.getOutcome() == RunOutcome.SUCCEEDED) {
+            ctx.bypassReason = null;
+        }
+        // 开发/测试/审查基础设施失败（同相位重试耗尽，或不可重试失败码直接判失败）→ 诚实放行：未真正
+        // 执行完成，如实标注。这属于「非代码缺陷」失败路径（用户策略：能放行就放行）；确认的
+        // BLOCKER/MAJOR 缺陷失败仍由下方 QUALITY_REPAIR_NOT_REQUESTED 等守卫判定保持失败，不受此覆盖影响。
+        // TESTING/REVIEWING 放行后若计划后续还有 REVIEW 步骤，success 会被下方 hasFollowingStep 降级为
+        // advance，并按「Test 不判任务失败、Review 是最终裁决」路由到 review 节点兜底审查（见 route 分支）。
+        // CODING 放行则相反：开发未完成没有可用代码可验证，必须直接以 SUCCEEDED 结束、不得 advance
+        // （见 ctx.codingInfraReleased 跳过 advance），避免推进 Test/Review 连环失败或空转。
+        if ((phase == OrchestrationPhase.CODING || phase == OrchestrationPhase.TESTING
+                || phase == OrchestrationPhase.REVIEWING)
+                && decision.getAction() == StateMachineDecision.Action.COMPLETE_FAILED
+                && outcome.getOutcome() == RunOutcome.FAILED_INFRASTRUCTURE) {
+            String gate;
+            switch (phase) {
+                case CODING -> {
+                    ctx.codingInfraReleased = true;
+                    gate = "开发未完成";
+                }
+                case TESTING -> gate = "测试未执行";
+                default -> gate = "审查未完成";
+            }
+            ctx.bypassReason = gate + "（基础设施问题：" + safeFailureCode(outcome.getFailureCode()) + "），已放行";
+            decision = StateMachineDecision.success();
+        }
         // 质量修复循环现在只由 REVIEWING 的 FAILED_QUALITY 触发（Test 不再自行判定失败，测试失败
         // 统一 TEST_FAILED 交 Review 裁决）。仍需 Review 明确声明失败是否可由 Coding 修复；旧 Agent/
         // 测试构造若没有结构化结果时保留历史兼容行为；一旦有结果且 needsCodingFix=false，直接终止，
@@ -632,24 +736,24 @@ public class TaskOrchestrator {
         }
         // 只读任务可能没有任何可修复的 MUTATE 步骤。此时质量失败不能沿用
         // requeue 路由回到一个 VERIFY/TEST 节点，否则会重复验证同一事实直到耗尽循环。
+        // 按「能放行就放行」策略：无修复入口时放行而非判失败——findings 作为审查结论如实保留并标注；
+        // 无 MUTATE 步骤 ⇒ 无代码交付，终态自然降级为无代码变更成功，没有自动交付风险。
         if (decision.getAction() == StateMachineDecision.Action.REQUEUE_CODING
                 && !hasMutableStep(ctx.steps)) {
-            ctx.recordQualityRepairUnavailable("QUALITY_REPAIR_STEP_UNAVAILABLE",
-                    "质量检查未通过，但当前计划没有可写的 MUTATE 开发步骤可用于修复");
-            decision = StateMachineDecision.failed();
+            ctx.bypassReason = "审查发现问题但无代码修改步骤可修复，已作为审查结论记录";
+            decision = StateMachineDecision.success();
         }
         // Review 判 BLOCKER/MAJOR 且测试因环境问题未执行时，不回 Coding：环境问题是执行环境缺陷
-        // 而非本次代码可修复，若打回 Coding 会让任务反复「改代码→再测→又环境失败」空转。放行路径
-        // （Review 判代码无误）仍走 COMPLETE_SUCCESS，终态卡片已如实标注「测试未通过/未执行原因」
-        // （见 finishTask 的 testNotPassedNote）。
+        // 而非本次代码可修复，若打回 Coding 会让任务反复「改代码→再测→又环境失败」空转。
+        // 按「能放行就放行」策略（含 MR_FIRST + BLOCKER，用户已确认）放行并如实标注测试未执行；
+        // 自动推送风险由 completeSuccess 的「MR_FIRST 放行不自动交付」兜底，无需在此区分 severity。
         if (decision.getAction() == StateMachineDecision.Action.REQUEUE_CODING
                 && phase == OrchestrationPhase.REVIEWING
                 && ctx.testResult != null && ctx.testResult.getEnvironmentFailureCode() != null
                 && !ctx.testResult.getEnvironmentFailureCode().isBlank()) {
-            ctx.recordQualityRepairUnavailable(ctx.testResult.getEnvironmentFailureCode(),
-                    "测试因环境问题未执行（" + ctx.testResult.getEnvironmentFailureCode()
-                            + "）；Review 兜底审查发现代码疑点，任务失败（环境问题不回 Coding）");
-            decision = StateMachineDecision.failed();
+            ctx.bypassReason = "测试因环境问题未执行（" + ctx.testResult.getEnvironmentFailureCode()
+                    + "），审查发现的问题已记录，已放行";
+            decision = StateMachineDecision.success();
         }
         // 质量循环不收敛：本轮与上一轮可修复项完全一致（无任何消减或变化）→ 提前终止，省下
         // 注定空转的循环预算（模型修不动或该 MAJOR 本身是误报时，再多打回也只会重复耗 LLM 调用）。
@@ -682,7 +786,13 @@ public class TaskOrchestrator {
         recordFailureDiagnostic(task, run, step, outcome);
         // AGENTS.md：Run 产物必须先成功落库，再发布 Run 终态事件；产物类型使用稳定相位名，
         // 不泄漏可扩展的 step role，保证前端时间线可识别 CODING/TESTING/REVIEWING。
-        artifactService.createRunArtifact(task, run, step, artifactType(phase), runArtifactSummary(step, outcome));
+        Map<String, Object> runSummary = runArtifactSummary(step, outcome);
+        // 放行时把如实原因一并落库（非敏感字段，可过 sanitizeSummary），与 findings 同处可查，
+        // 保证"测试未执行/审查未完成/发现问题但放行"这一事实可追踪，不伪装成审查通过。
+        if (ctx.bypassReason != null && !ctx.bypassReason.isBlank()) {
+            runSummary.put("bypassReason", ctx.bypassReason);
+        }
+        artifactService.createRunArtifact(task, run, step, artifactType(phase), runSummary);
         // 取消收敛：run 可能已在执行中被取消（RUNNING→CANCELLING）。此时结果由用户取消决定，
         // 不能把 outcome 决定的终态（FAILED/SUCCEEDED）覆盖上去，统一落 CANCELLED。
         TaskRunEntity latestRun = taskRunService.findById(run.getId());
@@ -700,6 +810,7 @@ public class TaskOrchestrator {
         markStepSettled(task, step, settledRun != null && "CANCELLED".equals(settledRun.getStatus())
                 ? RunOutcome.CANCELLED : outcome.getOutcome());
         if (decision.getAction() == StateMachineDecision.Action.COMPLETE_SUCCESS
+                && !ctx.codingInfraReleased
                 && hasFollowingStep(step, ctx.steps)) {
             decision = StateMachineDecision.advance(phase);
         }
@@ -707,7 +818,12 @@ public class TaskOrchestrator {
         switch (decision.getAction()) {
             case ADVANCE -> {
                 ctx.retryOf = null;
-                route = "next";
+                // TESTING 相位失败（验证/测试未通过）→ 交下一个 REVIEW 步骤裁决，而不是按序列
+                // next 继续执行后续步骤——否则 VERIFY 失败后仍会继续执行 MUTATE 写步骤
+                // （Test 不判任务失败，Review 是最终裁决，见 OrchestrationStateMachine）。
+                // TESTING SUCCEEDED 与其他相位仍正常按序推进。
+                route = phase == OrchestrationPhase.TESTING
+                        && outcome.getOutcome() != RunOutcome.SUCCEEDED ? "review" : "next";
             }
             case REQUEUE_CODING -> {
                 resetStepsForQualityRework(task, ctx.steps, ctx.repairCodingStepId());
@@ -845,15 +961,56 @@ public class TaskOrchestrator {
         } catch (java.util.concurrent.ExecutionException e) {
             Throwable cause = e.getCause();
             return infrastructureFailure(phase, "agent execution failed: "
-                    + (cause == null ? e.getMessage() : cause.getMessage()), null, "AGENT_EXECUTION",
+                    + (cause == null ? e.getMessage() : cause.getMessage()), llmFailureCode(cause), "AGENT_EXECUTION",
                     cause == null ? e : cause);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             return infrastructureFailure(phase, "agent run interrupted", null, "AGENT_INTERRUPTED", e);
         } catch (RuntimeException e) {
-            return infrastructureFailure(phase, "agent execution failed: " + e.getMessage(), null,
+            return infrastructureFailure(phase, "agent execution failed: " + e.getMessage(), llmFailureCode(e),
                     "AGENT_EXECUTION", e);
         }
+    }
+
+    /** 将供应商明确拒绝模型账号的响应转换为稳定、不可重试的业务错误码。 */
+    private String llmFailureCode(Throwable cause) {
+        for (Throwable current = cause; current != null; current = current.getCause()) {
+            String message = String.valueOf(current.getMessage()).toLowerCase(java.util.Locale.ROOT);
+            if (message.contains("access denied") && message.contains("account")) {
+                return "LLM_ACCOUNT_ACCESS_DENIED";
+            }
+            if (message.contains("unauthorized") || message.contains("invalid api key")
+                    || message.contains("authentication")) {
+                return "LLM_AUTH_FAILED";
+            }
+            if (message.contains("insufficient_quota") || message.contains("billing")
+                    || message.contains("payment required") || message.contains("quota exceeded")) {
+                return "LLM_BILLING_REQUIRED";
+            }
+            if (message.contains("rate limit") || message.contains("too many requests")) {
+                return "LLM_RATE_LIMITED";
+            }
+            if (message.contains("model") && (message.contains("not found")
+                    || message.contains("does not exist") || message.contains("not available"))) {
+                return "LLM_MODEL_NOT_FOUND";
+            }
+            if (message.contains("invalid request") || message.contains("invalid parameter")
+                    || message.contains("bad request")) {
+                return "LLM_REQUEST_INVALID";
+            }
+            if (message.contains("timeout") || message.contains("timed out")) {
+                return "LLM_TIMEOUT";
+            }
+            if (message.contains("connection refused") || message.contains("connection reset")
+                    || message.contains("network is unreachable") || message.contains("dns")) {
+                return "LLM_NETWORK_FAILED";
+            }
+            if (message.contains("service unavailable") || message.contains("bad gateway")
+                    || message.contains("temporarily unavailable")) {
+                return "LLM_SERVICE_UNAVAILABLE";
+            }
+        }
+        return null;
     }
 
     private AgentRunOutcome infrastructureFailure(OrchestrationPhase phase, String message, String failureCode) {
@@ -1017,6 +1174,14 @@ public class TaskOrchestrator {
         return truncate(ExecutionContentSanitizer.sanitizeDiagnosticDetail(value == null ? "" : value).strip(), max);
     }
 
+    /** 公开放行文案中的失败码只保留限长、脱敏后的稳定标识，缺失时用占位符。 */
+    private String safeFailureCode(String code) {
+        if (code == null || code.isBlank()) {
+            return "未知";
+        }
+        return truncate(ExecutionContentSanitizer.sanitizeDiagnosticDetail(code).strip(), 48);
+    }
+
     private String lastDeveloperNodeId(List<TaskStepEntity> steps) {
         for (int index = steps.size() - 1; index >= 0; index--) {
             TaskStepEntity step = steps.get(index);
@@ -1137,6 +1302,13 @@ public class TaskOrchestrator {
             }
             return;
         }
+        // 恢复器可能已经把卡死启动窗口收敛为 FAILED；旧线程晚返回时不得用过期上下文
+        // 覆盖任务终态，也不得重复发送成功/失败卡片。
+        if (latest == null || !STARTABLE_TASK_STATUSES.contains(latest.getStatus())) {
+            log.info("skip stale orchestration terminal update taskId={} status={}", task.getId(),
+                    latest == null ? "MISSING" : latest.getStatus());
+            return;
+        }
         FinishingStatus finishing = switch (action) {
             case COMPLETE_SUCCESS -> completeSuccess(task, ctx);
             case COMPLETE_CANCELLED -> new FinishingStatus("CANCELLED", null, null);
@@ -1195,12 +1367,23 @@ public class TaskOrchestrator {
         // Review 放行但测试未真实通过时，终态如实标注原因，不得描述为测试通过。
         // 环境阻塞/未检测到测试命令/执行超时属「测试未完成验证」（TestResult.isInconclusive()），
         // 其余是测试真实执行并给出失败结论（如代码缺陷失败但 Review 判定无 BLOCKER/MAJOR）。
+        // Review 被放行（审查未完成 / 发现问题但按策略放行）时改由下方放行原因标注，不再说"代码审查通过"。
         if (action == StateMachineDecision.Action.COMPLETE_SUCCESS && !"FAILED".equals(finishing.status())
+                && ctx.bypassReason == null
                 && ctx.testResult != null && !ctx.testResult.isSuccess()) {
             String note = testNotPassedNote(ctx.testResult);
             if (note != null) {
                 cardMessage = cardMessage + "；代码审查通过，但" + note;
             }
+        }
+        // Review 放行（审查未完成 / 发现问题但按策略放行）：如实标注放行原因，findings 不隐藏。
+        // MR_FIRST 下任务 SUCCEEDED 但代码未自动交付（见 completeSuccess），必须提示人工处理。
+        if (ctx.bypassReason != null && !"FAILED".equals(finishing.status())) {
+            String reason = ctx.bypassReason;
+            if ("SUCCEEDED".equals(finishing.status()) && DeliveryMode.MR_FIRST.equals(task.getDeliveryMode())) {
+                reason = reason + "；代码未自动交付，请人工处理";
+            }
+            cardMessage = cardMessage + "；" + reason;
         }
         sendAgentCard(task, "task-" + task.getId(), finishing.status(), null, cardMessage);
     }
@@ -1256,8 +1439,19 @@ public class TaskOrchestrator {
 
     /**
      * 成功终态按交付模式路由：MR_FIRST 直达系统交付（仅 commit/push），DIFF_FIRST 走待确认 Diff 批次。
+     * 质量门禁被放行（测试未执行 / 审查未完成 / 发现问题但按策略放行）时，MR_FIRST 不得自动
+     * commit/push/建 PR：直接以 SUCCEEDED 结束并如实标注，代码留在工作区由人工处理——自动交付必须有
+     * 真实的测试与审查闸门，即使审查发现 BLOCKER 也不自动推送（用户已确认"也放行"，安全由不自动交付兜底）。
+     * CODING 基础设施失败被放行（开发未完成）时同理：没有任何可交付代码，DIFF_FIRST 也不生成
+     * 待确认 Diff 批次——没有代码可确认（createPendingBatch 用空 run 只会落空），一律直接 SUCCEEDED。
      */
     private FinishingStatus completeSuccess(TaskEntity task, TaskExecutionContext ctx) {
+        if (DeliveryMode.MR_FIRST.equals(task.getDeliveryMode()) && ctx.bypassReason != null) {
+            return new FinishingStatus("SUCCEEDED", null, null);
+        }
+        if (ctx.codingInfraReleased) {
+            return new FinishingStatus("SUCCEEDED", null, null);
+        }
         if (DeliveryMode.MR_FIRST.equals(task.getDeliveryMode())) {
             return completeWithMrFirst(task, ctx);
         }
@@ -1276,6 +1470,11 @@ public class TaskOrchestrator {
     private FinishingStatus completeWithMrFirst(TaskEntity task, TaskExecutionContext ctx) {
         log.info("mr-first task enters delivery taskId={} mode={} reason={}", task.getId(), task.getDeliveryMode(),
                 task.getDeliveryReason());
+        if (!hasMutableStep(ctx.steps)) {
+            log.info("mr-first task has no mutable step, finishes without code delivery taskId={}", task.getId());
+            publishDiffReviewSkipped(task, "NO_MUTATION_STEP");
+            return new FinishingStatus("SUCCEEDED", null, NO_CODE_CHANGES_MESSAGE);
+        }
         try {
             UUID finalCodingRunId = ctx.lastCodingRunId;
             if (finalCodingRunId == null) {
@@ -1305,11 +1504,16 @@ public class TaskOrchestrator {
     }
 
     /**
-     * 成功终态：生成待用户确认的 Diff 批次。无未提交改动（FINAL_DIFF_EMPTY）视为业务上的成功
-     * 降级为 SUCCEEDED 并发布 diff-review.skipped 事件作为依据；其余失败（内部一致性、快照无效、
-     * Worker 不可用等）落 FAILED，不伪装成成功（后端3 决策：按异常类型区分，不统一降级）。
+     * 成功终态：有可写步骤时生成待用户确认的 Diff 批次。只有 VERIFY/TEST/REVIEW 的只读计划
+     * 没有代码交付来源，直接以无代码变更成功收敛；无未提交改动（FINAL_DIFF_EMPTY）同样视为业务上的
+     * 成功并发布 diff-review.skipped 事件。其余失败（内部一致性、快照无效、Worker 不可用等）落 FAILED。
      */
     private FinishingStatus completeWithDiffBatch(TaskEntity task, TaskExecutionContext ctx) {
+        if (!hasMutableStep(ctx.steps)) {
+            log.info("diff-first task has no mutable step, finishes without diff taskId={}", task.getId());
+            publishDiffReviewSkipped(task, "NO_MUTATION_STEP");
+            return new FinishingStatus("SUCCEEDED", null, NO_CODE_CHANGES_MESSAGE);
+        }
         try {
             UUID finalCodingRunId = ctx.lastCodingRunId;
             if (finalCodingRunId == null) {
@@ -1691,7 +1895,13 @@ public class TaskOrchestrator {
          * 各相位最近一次基础设施失败，仅在该相位重试时优先回灌；不覆盖仍待复核的质量反馈。
          */
         private final java.util.Map<UUID, AgentRunOutcome> infraFeedback = new java.util.HashMap<>();
+        /** 当前正在启动或执行的步骤，供异常补偿使用。 */
+        private UUID activeStepId;
+        /** 当前步骤的 TaskRun；创建成功后立即记录，覆盖 QUEUED/RUNNING 异常窗口。 */
+        private UUID activeRunId;
         private UUID lastRunId;
+        /** 启动窗口被恢复器或异常收敛后，旧线程不得继续进入图执行。 */
+        private volatile boolean aborted;
         private UUID retryOf;
         /**
          * 本次续跑的起始步骤 ID（用户重试/恢复器续跑传入）；null 表示全量编排。
@@ -1712,6 +1922,21 @@ public class TaskOrchestrator {
          * 避免把“根本没有修复入口”误报成“多次修复后仍失败”。
          */
         private QualityRepairUnavailable qualityRepairUnavailable;
+        /**
+         * 质量门禁阶段（测试/审查）被「放行」（绕过失败：测试未执行 / 审查未完成 / 发现问题但按
+         * 策略放行）时的如实原因。
+         * 非空时终态卡片如实标注该原因，并禁止 MR_FIRST 自动 commit/push/建 PR（代码留工作区
+         * 人工处理）；Review 发现的 findings 仍完整落库，绝不隐藏或伪装成审查通过。
+         * 注意：若后续某次 TESTING 真实执行成功（环境恢复），必须清除本标记——否则终态会引用
+         * 已失效的「测试未执行」旧事实，见 runStepNode 中 TESTING SUCCEEDED 的清除逻辑。
+         */
+        private String bypassReason;
+        /**
+         * CODING 基础设施失败被放行（开发未完成）时为 true：任务必须直接以 SUCCEEDED 结束，
+         * 不得推进到后续 Test/Review——没有可用代码可验证，推进只会连环失败或空转。
+         * 仅本次 CODING 放行时设置；放行后任务立即收敛，不会泄漏到后续步骤。
+         */
+        private boolean codingInfraReleased;
         /**
          * 本次 orchestrate 快照的群聊/Skill/Memory 上下文，跨节点复用；组装失败时为 null（不阻断）。
          */

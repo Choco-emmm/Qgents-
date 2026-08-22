@@ -155,7 +155,8 @@ public class GitHubOAuthService {
      * 计算个人仓库开通前置状态，供前端在 OAuth 绑定前后做引导：
      * NOT_OWNER（非团队 Owner，无法个人建仓）、NEED_INSTALLATION（需先安装 GitHub App）、
      * NEED_OAUTH（App 已装但未绑 OAuth）、ACCOUNT_MISMATCH（OAuth 账号与 App 安装账号不一致，
-     * 应提示用户重新绑定 OAuth 而非重装 App）、READY（可建仓）。
+     * 应提示用户重新绑定 OAuth 而非重装 App）、NEED_ALL_REPOSITORIES_ACCESS（个人 Installation
+     * 仅选择了部分仓库）、READY（可建仓）。
      * 安装账号取用户作为 Owner 的团队下 ACTIVE 的 USER 类型安装。
      */
     private void applyPersonalRepositorySetup(GitHubOAuthStatusResponse response, UUID userId, String oauthLogin) {
@@ -166,13 +167,11 @@ public class GitHubOAuthService {
             response.setPersonalRepositorySetup("NOT_OWNER");
             return;
         }
-        List<String> userInstallLogins = installationMapper.selectList(Wrappers.<GitHubInstallationEntity>lambdaQuery()
+        List<GitHubInstallationEntity> userInstallations = installationMapper.selectList(Wrappers.<GitHubInstallationEntity>lambdaQuery()
                         .in(GitHubInstallationEntity::getTeamId, ownedTeamIds)
                         .eq(GitHubInstallationEntity::getAccountType, "USER")
-                        .eq(GitHubInstallationEntity::getStatus, "ACTIVE"))
-                .stream().map(GitHubInstallationEntity::getAccountLogin)
-                .filter(Objects::nonNull).distinct().toList();
-        if (userInstallLogins.isEmpty()) {
+                        .eq(GitHubInstallationEntity::getStatus, "ACTIVE"));
+        if (userInstallations.isEmpty()) {
             response.setPersonalRepositorySetup("NEED_INSTALLATION");
             return;
         }
@@ -180,12 +179,24 @@ public class GitHubOAuthService {
             response.setPersonalRepositorySetup("NEED_OAUTH");
             return;
         }
-        if (userInstallLogins.stream().anyMatch(login -> login.equalsIgnoreCase(oauthLogin))) {
+        GitHubInstallationEntity matching = userInstallations.stream()
+                .filter(installation -> installation.getAccountLogin() != null
+                        && installation.getAccountLogin().equalsIgnoreCase(oauthLogin))
+                .findFirst().orElse(null);
+        if (matching != null) {
+            response.setUserInstallationId(matching.getId());
+            response.setRepositoryAccessScope(matching.getRepositorySelection());
+            // NULL 表示迁移前的历史 Installation 尚未同步范围，也不能向前端宣称可自动建仓。
+            if (!"ALL".equalsIgnoreCase(matching.getRepositorySelection())) {
+                response.setPersonalRepositorySetup("NEED_ALL_REPOSITORIES_ACCESS");
+                return;
+            }
             response.setPersonalRepositorySetup("READY");
             return;
         }
         response.setPersonalRepositorySetup("ACCOUNT_MISMATCH");
-        response.setExpectedInstallationLogin(userInstallLogins.get(0));
+        response.setExpectedInstallationLogin(userInstallations.stream()
+                .map(GitHubInstallationEntity::getAccountLogin).filter(Objects::nonNull).findFirst().orElse(null));
     }
 
     /**
@@ -225,9 +236,13 @@ public class GitHubOAuthService {
 
     public PersonalCredential requirePersonalCredential(UUID userId) {
         GitHubUserAuthorizationEntity entity = findByUser(userId);
-        if (entity == null || !"ACTIVE".equals(entity.getStatus())) {
+        if (entity == null) {
+            throw new ApiException(HttpStatus.CONFLICT, "GITHUB_OAUTH_REQUIRED",
+                    "创建个人 GitHub 仓库前请先关联个人 GitHub 账号");
+        }
+        if (!"ACTIVE".equals(entity.getStatus())) {
             throw new ApiException(HttpStatus.CONFLICT, "GITHUB_OAUTH_REVOKED",
-                    "请先关联个人 GitHub 账号");
+                    "个人 GitHub 授权已失效，请重新关联 GitHub 账号");
         }
         return new PersonalCredential(cipher.decrypt(entity.getAccessTokenCiphertext()),
                 entity.getProviderUserId(), entity.getProviderLogin(), parseScopes(entity.getScopes()));

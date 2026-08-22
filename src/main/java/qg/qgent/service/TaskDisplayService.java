@@ -97,16 +97,18 @@ public class TaskDisplayService {
     }
 
     /**
-     * 任务中心列表：游标分页并支持 groupId/status/createdBy/repositoryId/keyword 筛选。
+     * 任务中心列表：游标分页并支持 groupId/status/excludeStatus/createdBy/repositoryId/keyword 筛选。
      * <p>
      * repositoryId 筛选在 SQL 层完成（workspace_id IN 子查询），避免只过滤当前页导致的漏数据；
      * keyword 同样在 SQL 层完成（参数化 LIKE，跨任务/需求群/创建人/绑定仓库匹配），
      * cursor 与分页基于关键词筛选后的结果集计算。
+     * status（in）与 excludeStatus（not in）均支持逗号分隔多值，可同时使用：
+     * 任务中心「隐藏已完成任务」传 excludeStatus=SUCCEEDED，由服务端过滤保证游标分页正确。
      * 一页任务的后置数据（步骤/运行/输入请求/仓库/用户/群）批量加载后内存组装。
      */
     public PagedApiResponse<TaskListItemResponse> list(UUID projectId, UUID actor, String groupId, String status,
-                                                       String createdBy, String repositoryId, String keyword,
-                                                       String cursor, Integer limit, String requestId) {
+                                                       String excludeStatus, String createdBy, String repositoryId,
+                                                       String keyword, String cursor, Integer limit, String requestId) {
         access.requireProjectMember(projectId, actor);
         int size = clampLimit(limit);
         UUID cursorUuid = parseCursor(cursor);
@@ -128,6 +130,7 @@ public class TaskDisplayService {
                 .in(TaskEntity::getRequirementGroupId, visibleGroups)
                 .eq(groupUuid != null, TaskEntity::getRequirementGroupId, groupUuid)
                 .in(!splitStatuses(status).isEmpty(), TaskEntity::getStatus, splitStatuses(status))
+                .notIn(!splitStatuses(excludeStatus).isEmpty(), TaskEntity::getStatus, splitStatuses(excludeStatus))
                 .eq(creatorUuid != null, TaskEntity::getCreatedBy, creatorUuid)
                 .apply(repositoryUuid != null,
                         "workspace_id in (select workspace_id from workspace_repositories where project_repository_id = {0})",
@@ -170,6 +173,7 @@ public class TaskDisplayService {
         }
         List<TaskStepEntity> stepList = steps.selectList(Wrappers.<TaskStepEntity>lambdaQuery()
                 .eq(TaskStepEntity::getTaskId, taskId).orderByAsc(TaskStepEntity::getSequenceNo));
+        Set<UUID> activeRepositoryIds = activeRepositoryIds(stepList);
         List<TaskRunEntity> allRuns = runs.selectList(Wrappers.<TaskRunEntity>lambdaQuery()
                 .eq(TaskRunEntity::getTaskId, taskId));
         Map<UUID, List<InputRequestEntity>> inputByRun = loadInputByRun(allRuns);
@@ -198,7 +202,7 @@ public class TaskDisplayService {
                 groupSummary(groupById.get(task.getRequirementGroupId())),
                 userSummary(userById.get(task.getCreatedBy())), criteria, execution,
                 attention,
-                workspaceSummary(task, worktreeData), buildCapabilities(task, actor, stepList, batch),
+                workspaceSummary(task, worktreeData, activeRepositoryIds), buildCapabilities(task, actor, stepList, batch),
                 artifactSummary(taskId), diffReviewSummary(batch, batchDiffs), sourceMessage(task),
                 id(task.getTriggerMessageId()), iso(task.getCreatedAt()), iso(task.getUpdatedAt()));
     }
@@ -278,15 +282,27 @@ public class TaskDisplayService {
 
     private List<TaskListItemResponse> buildListItems(List<TaskEntity> page) {
         List<UUID> taskIds = page.stream().map(TaskEntity::getId).toList();
-        List<UUID> workspaceIds = page.stream().map(TaskEntity::getWorkspaceId).distinct().toList();
-        List<UUID> groupIds = page.stream().map(TaskEntity::getRequirementGroupId).distinct().toList();
-        List<UUID> creatorIds = page.stream().map(TaskEntity::getCreatedBy).distinct().toList();
+        List<UUID> workspaceIds = page.stream().map(TaskEntity::getWorkspaceId).filter(Objects::nonNull).distinct().toList();
+        List<UUID> groupIds = page.stream().map(TaskEntity::getRequirementGroupId).filter(Objects::nonNull).distinct().toList();
+        List<UUID> creatorIds = page.stream().map(TaskEntity::getCreatedBy).filter(Objects::nonNull).distinct().toList();
 
         Map<UUID, List<TaskStepEntity>> stepsByTask = steps
                 .selectList(Wrappers.<TaskStepEntity>lambdaQuery().in(TaskStepEntity::getTaskId, taskIds)).stream()
                 .collect(Collectors.groupingBy(TaskStepEntity::getTaskId));
-        List<TaskRunEntity> allRuns = runs.selectList(Wrappers.<TaskRunEntity>lambdaQuery()
-                .in(TaskRunEntity::getTaskId, taskIds));
+        Map<UUID, UUID> taskByStep = stepsByTask.entrySet().stream()
+                .flatMap(entry -> entry.getValue().stream().map(step -> Map.entry(step.getId(), entry.getKey())))
+                .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
+        Map<UUID, Set<UUID>> writableRepositoriesByTask = taskByStep.isEmpty() ? Collections.emptyMap()
+                : stepRepositories.selectByStepIds(new ArrayList<>(taskByStep.keySet())).stream()
+                .filter(scope -> "WRITE".equals(scope.getAccessMode()))
+                .filter(scope -> {
+                    TaskStepEntity step = stepsByTask.getOrDefault(taskByStep.get(scope.getTaskStepId()), List.of()).stream()
+                            .filter(value -> value.getId().equals(scope.getTaskStepId())).findFirst().orElse(null);
+                    return step != null && "DEVELOPER".equals(step.getRole());
+                })
+                .collect(Collectors.groupingBy(scope -> taskByStep.get(scope.getTaskStepId()),
+                        Collectors.mapping(TaskStepRepositoryEntity::getProjectRepositoryId, Collectors.toSet())));
+        List<TaskRunEntity> allRuns = loadTaskListRuns(taskIds);
         Map<UUID, List<TaskRunEntity>> runsByTask = allRuns.stream()
                 .collect(Collectors.groupingBy(TaskRunEntity::getTaskId));
         Map<UUID, List<InputRequestEntity>> inputByRun = loadInputByRun(allRuns);
@@ -300,30 +316,36 @@ public class TaskDisplayService {
                 .selectList(Wrappers.<RequirementGroupEntity>lambdaQuery().in(RequirementGroupEntity::getId, groupIds))
                 .stream().collect(Collectors.toMap(RequirementGroupEntity::getId, Function.identity()));
         Map<UUID, DiffReviewBatchEntity> batchByTask = taskIds.isEmpty() ? Collections.emptyMap() : diffBatches
-                .selectList(Wrappers.<DiffReviewBatchEntity>lambdaQuery().in(DiffReviewBatchEntity::getTaskId, taskIds))
-                .stream().collect(Collectors.toMap(DiffReviewBatchEntity::getTaskId, Function.identity()));
+                .selectList(Wrappers.<DiffReviewBatchEntity>lambdaQuery().in(DiffReviewBatchEntity::getTaskId, taskIds)
+                        .orderByDesc(DiffReviewBatchEntity::getCreatedAt).orderByDesc(DiffReviewBatchEntity::getId))
+                .stream().collect(Collectors.toMap(DiffReviewBatchEntity::getTaskId, Function.identity(), (first, ignored) -> first));
         Set<UUID> batchIds = batchByTask.values().stream().map(DiffReviewBatchEntity::getId).collect(Collectors.toSet());
         Map<UUID, List<DiffEntity>> diffsByBatch = batchIds.isEmpty() ? Collections.emptyMap() : diffs
-                .selectList(Wrappers.<DiffEntity>lambdaQuery().in(DiffEntity::getReviewBatchId, batchIds)).stream()
+                // The list attention only needs to identify a failed delivery repository;
+                // full diff content remains available from the detail/diff endpoints.
+                .selectList(Wrappers.<DiffEntity>lambdaQuery().in(DiffEntity::getReviewBatchId, batchIds)
+                        .eq(DiffEntity::getDeliveryStatus, "FAILED")).stream()
                 .collect(Collectors.groupingBy(DiffEntity::getReviewBatchId));
 
         return page.stream().map(task -> toListItem(task,
                         stepsByTask.getOrDefault(task.getId(), List.of()),
-                        runsByTask.getOrDefault(task.getId(), List.of()), inputByRun,
-                        worktreesByTask.getOrDefault(task.getWorkspaceId(), List.of()), worktreeData, userById, groupById,
+                runsByTask.getOrDefault(task.getId(), List.of()), inputByRun,
+                        worktreesByTask.getOrDefault(task.getWorkspaceId(), List.of()),
+                        writableRepositoriesByTask.getOrDefault(task.getId(), Set.of()), worktreeData, userById, groupById,
                         batchByTask.get(task.getId()), diffsByBatch))
                 .toList();
     }
 
     private TaskListItemResponse toListItem(TaskEntity task, List<TaskStepEntity> stepList, List<TaskRunEntity> taskRuns,
                                             Map<UUID, List<InputRequestEntity>> inputByRun, List<WorkspaceRepositoryEntity> worktreeList,
-                                            WorktreeData worktreeData, Map<UUID, UserEntity> userById,
+                                            Set<UUID> activeRepositoryIds, WorktreeData worktreeData, Map<UUID, UserEntity> userById,
                                             Map<UUID, RequirementGroupEntity> groupById,
                                             DiffReviewBatchEntity batch, Map<UUID, List<DiffEntity>> diffsByBatch) {
         Attention attention = buildAttention(task, taskRuns, inputByRun, batch,
                 batch == null ? List.of() : diffsByBatch.getOrDefault(batch.getId(), List.of()));
         ExecutionSummary execution = buildExecutionSummary(stepList, taskRuns, attention != null);
         List<RepositorySummary> repositories = worktreeList.stream()
+                .filter(w -> activeRepositoryIds.contains(w.getProjectRepositoryId()))
                 .map(w -> repositorySummary(w, worktreeData.bindingById.get(w.getProjectRepositoryId()),
                         worktreeData.repoById.get(bindingRepositoryId(worktreeData, w.getProjectRepositoryId()))))
                 .toList();
@@ -555,13 +577,37 @@ public class TaskDisplayService {
                 worktree == null ? null : worktree.getHeadCommit());
     }
 
-    private WorkspaceSummary workspaceSummary(TaskEntity task, WorktreeData data) {
+    private WorkspaceSummary workspaceSummary(TaskEntity task, WorktreeData data, Set<UUID> activeRepositoryIds) {
         WorkspaceEntity workspace = workspaces.selectById(task.getWorkspaceId());
         List<RepositorySummary> repos = data.worktrees.stream()
+                .filter(w -> activeRepositoryIds.contains(w.getProjectRepositoryId()))
                 .map(w -> repositorySummary(w, data.bindingById.get(w.getProjectRepositoryId()),
                         data.repoById.get(bindingRepositoryId(data, w.getProjectRepositoryId()))))
                 .toList();
         return new WorkspaceSummary(id(task.getWorkspaceId()), workspace == null ? null : workspace.getStatus(), repos);
+    }
+
+    /**
+     * Planner 尚未物化开发步骤时返回空集合；物化完成后只暴露真正拥有 WRITE 权限的
+     * DEVELOPER 步骤仓库。TESTER/REVIEWER 的 READ 范围是执行上下文，不代表任务要修改
+     * 该仓库，不能把它们展示为任务目标仓库。
+     */
+    private Set<UUID> activeRepositoryIds(List<TaskStepEntity> stepList) {
+        if (stepList == null || stepList.isEmpty()) {
+            return Set.of();
+        }
+        Map<UUID, TaskStepEntity> byId = stepList.stream()
+                .collect(Collectors.toMap(TaskStepEntity::getId, Function.identity(), (first, ignored) -> first));
+        List<UUID> stepIds = stepList.stream().map(TaskStepEntity::getId).toList();
+        return stepRepositories.selectByStepIds(stepIds).stream()
+                .filter(scope -> "WRITE".equals(scope.getAccessMode()))
+                .filter(scope -> {
+                    TaskStepEntity step = byId.get(scope.getTaskStepId());
+                    return step != null && "DEVELOPER".equals(step.getRole());
+                })
+                .map(TaskStepRepositoryEntity::getProjectRepositoryId)
+                .filter(Objects::nonNull)
+                .collect(Collectors.toCollection(LinkedHashSet::new));
     }
 
     private ArtifactSummary artifactSummary(UUID taskId) {
@@ -745,6 +791,24 @@ public class TaskDisplayService {
         return inputRequests
                 .selectList(Wrappers.<InputRequestEntity>lambdaQuery().in(InputRequestEntity::getTaskRunId, runIds))
                 .stream().collect(Collectors.groupingBy(InputRequestEntity::getTaskRunId));
+    }
+
+    /**
+     * 列表摘要只需要每个步骤的最新运行，以及每个任务最新失败运行。
+     * 后者用于保留失败提示能力，前者用于执行统计和等待输入判断。
+     */
+    private List<TaskRunEntity> loadTaskListRuns(List<UUID> taskIds) {
+        if (taskIds.isEmpty()) {
+            return List.of();
+        }
+        Map<UUID, TaskRunEntity> byId = new LinkedHashMap<>();
+        for (TaskRunEntity run : runs.selectLatestForTaskList(taskIds)) {
+            byId.put(run.getId(), run);
+        }
+        for (TaskRunEntity run : runs.selectLatestFailedForTaskList(taskIds)) {
+            byId.putIfAbsent(run.getId(), run);
+        }
+        return new ArrayList<>(byId.values());
     }
 
     private DiffReviewBatchEntity latestBatch(UUID projectId, UUID taskId) {

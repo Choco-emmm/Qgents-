@@ -4,6 +4,7 @@ import com.auth0.jwt.JWT;
 import com.auth0.jwt.JWTVerifier;
 import com.auth0.jwt.algorithms.Algorithm;
 import com.auth0.jwt.interfaces.DecodedJWT;
+import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import org.bouncycastle.asn1.pkcs.PrivateKeyInfo;
 import org.bouncycastle.openssl.PEMKeyPair;
@@ -125,7 +126,16 @@ public class RestGitHubAppClient implements GitHubAppClient {
             if (response == null || response.account() == null) {
                 throw upstreamFailure();
             }
-            return new GitHubInstallationDetails(response.id(), response.account().login(), response.account().type());
+            return new GitHubInstallationDetails(response.id(), response.account().login(), response.account().type(),
+                    response.repositorySelection());
+        } catch (RestClientResponseException exception) {
+            log.warn("GitHub installation lookup rejected: installationId={} status={} body={}",
+                    installationId, exception.getStatusCode().value(), exception.getResponseBodyAsString());
+            if (exception.getStatusCode().value() == HttpStatus.NOT_FOUND.value()) {
+                throw new ApiException(HttpStatus.NOT_FOUND, "GITHUB_INSTALLATION_NOT_FOUND",
+                        "GitHub App Installation 不存在或已被删除");
+            }
+            throw upstreamFailure();
         } catch (RestClientException exception) {
             throw upstreamFailure();
         }
@@ -166,6 +176,10 @@ public class RestGitHubAppClient implements GitHubAppClient {
         } catch (RestClientResponseException exception) {
             log.warn("GitHub installation token request rejected: status={}, body={}",
                     exception.getStatusCode().value(), exception.getResponseBodyAsString());
+            if (exception.getStatusCode().value() == HttpStatus.NOT_FOUND.value()) {
+                throw new ApiException(HttpStatus.NOT_FOUND, "GITHUB_INSTALLATION_NOT_FOUND",
+                        "GitHub App Installation 不存在或已被删除");
+            }
             throw upstreamFailure();
         } catch (RestClientException exception) {
             log.warn("GitHub installation token request failed before receiving a response: {}",
@@ -314,7 +328,32 @@ public class RestGitHubAppClient implements GitHubAppClient {
                 "GitHub API is unavailable or rejected the integration credentials");
     }
 
-    private record InstallationResponse(long id, AccountResponse account) {
+    private ApiException mergeRejected(RestClientResponseException exception) {
+        int status = exception.getStatusCode().value();
+        String providerMessage = extractProviderMessage(exception.getResponseBodyAsString());
+        String message = providerMessage == null || providerMessage.isBlank()
+                ? "GitHub 拒绝了合并请求（HTTP " + status + "）"
+                : "GitHub 拒绝了合并请求：" + providerMessage;
+        return new ApiException(HttpStatus.BAD_GATEWAY, "GITHUB_MERGE_REJECTED", message,
+                List.of(java.util.Map.of("providerStatus", status, "providerMessage",
+                        providerMessage == null ? "" : providerMessage)));
+    }
+
+    private String extractProviderMessage(String body) {
+        if (body == null || body.isBlank()) {
+            return null;
+        }
+        java.util.regex.Matcher matcher = java.util.regex.Pattern
+                .compile("\\\"message\\\"\\s*:\\s*\\\"((?:\\\\.|[^\\\"])*)\\\"")
+                .matcher(body);
+        if (!matcher.find()) {
+            return null;
+        }
+        return matcher.group(1).replace("\\n", " ").replace("\\\"", "\\\"").trim();
+    }
+
+    private record InstallationResponse(long id, AccountResponse account,
+                                        @JsonProperty("repository_selection") String repositorySelection) {
     }
 
     private record AccountResponse(String login, String type) {
@@ -512,6 +551,40 @@ public class RestGitHubAppClient implements GitHubAppClient {
     }
 
     @Override
+    public GitHubPullRequestCommitList getPullRequestCommits(long installationId, String owner, String repo,
+                                                              int pullNumber, int limit) {
+        requireConfigured();
+        if (limit < 1 || limit > 100) {
+            throw new IllegalArgumentException("limit must be between 1 and 100");
+        }
+        try {
+            PullRequestResponse pullRequest = client.get()
+                    .uri("/repos/{owner}/{repo}/pulls/{pullNumber}", owner, repo, pullNumber)
+                    .headers(headers -> githubHeaders(headers, installationTokenProvider.apply(installationId)))
+                    .retrieve()
+                    .body(PullRequestResponse.class);
+            if (pullRequest == null || pullRequest.commits() == null || pullRequest.commits() < 0) {
+                throw upstreamFailure();
+            }
+            PullRequestCommitResponse[] response = client.get()
+                    .uri(uriBuilder -> uriBuilder.path("/repos/{owner}/{repo}/pulls/{pullNumber}/commits")
+                            .queryParam("per_page", limit).build(owner, repo, pullNumber))
+                    .headers(headers -> githubHeaders(headers, installationTokenProvider.apply(installationId)))
+                    .retrieve()
+                    .body(PullRequestCommitResponse[].class);
+            if (response == null) {
+                throw upstreamFailure();
+            }
+            List<GitHubPullRequestCommitDetails> items = java.util.Arrays.stream(response)
+                    .map(this::toPullRequestCommit)
+                    .toList();
+            return new GitHubPullRequestCommitList(Math.max(pullRequest.commits(), items.size()), items);
+        } catch (RestClientException exception) {
+            throw upstreamFailure();
+        }
+    }
+
+    @Override
     public List<GitHubCheckRunDetails> getPullRequestChecks(long installationId, String owner, String repo, String headSha) {
         requireConfigured();
         try {
@@ -597,7 +670,13 @@ public class RestGitHubAppClient implements GitHubAppClient {
                 throw upstreamFailure();
             }
             return new GitHubPullRequestMergeResult(response.merged(), response.sha(), response.message());
+        } catch (RestClientResponseException exception) {
+            log.warn("GitHub mergePullRequest rejected: owner={} repo={} number={} status={} body={}",
+                    owner, repo, pullNumber, exception.getStatusCode().value(), exception.getResponseBodyAsString());
+            throw mergeRejected(exception);
         } catch (RestClientException exception) {
+            log.warn("GitHub mergePullRequest failed before receiving a response: owner={} repo={} number={} {}",
+                    owner, repo, pullNumber, exception.getMessage());
             throw upstreamFailure();
         }
     }
@@ -612,10 +691,22 @@ public class RestGitHubAppClient implements GitHubAppClient {
                 response.htmlUrl(), response.mergeable(), response.mergeableState(), response.base().sha());
     }
 
+    private GitHubPullRequestCommitDetails toPullRequestCommit(PullRequestCommitResponse response) {
+        if (response == null || response.sha() == null || response.sha().isBlank() || response.commit() == null
+                || response.commit().message() == null || response.commit().message().isBlank()
+                || response.commit().author() == null || response.commit().author().name() == null
+                || response.commit().author().name().isBlank() || response.commit().author().date() == null
+                || response.commit().author().date().isBlank()) {
+            throw upstreamFailure();
+        }
+        return new GitHubPullRequestCommitDetails(response.sha(), response.commit().message(),
+                response.commit().author().name(), null, response.commit().author().date());
+    }
+
     private record PullRequestResponse(long id, int number, String state, String title,
                                        @JsonProperty("html_url") String htmlUrl, PullRequestRef head,
                                        PullRequestRef base, Boolean merged, Boolean mergeable,
-                                       @JsonProperty("mergeable_state") String mergeableState) {
+                                       @JsonProperty("mergeable_state") String mergeableState, Integer commits) {
     }
 
     private record PullRequestRef(String ref, String sha) {
@@ -631,11 +722,22 @@ public class RestGitHubAppClient implements GitHubAppClient {
                                   @JsonProperty("author_association") String authorAssociation, AccountResponse user) {
     }
 
+    private record PullRequestCommitResponse(String sha, PullRequestCommitMetadata commit) {
+    }
+
+    private record PullRequestCommitMetadata(String message, GitCommitAuthor author) {
+    }
+
+    private record GitCommitAuthor(String name, String date) {
+    }
+
+
     private record CommentResponse(long id, String body,
                                    @JsonProperty("html_url") String htmlUrl,
                                    @JsonProperty("created_at") String createdAt) {
     }
 
+    @JsonInclude(JsonInclude.Include.NON_NULL)
     private record MergeRequestBody(@JsonProperty("commit_title") String commitTitle,
                                     @JsonProperty("commit_message") String commitMessage,
                                     @JsonProperty("merge_method") String mergeMethod, String sha) {

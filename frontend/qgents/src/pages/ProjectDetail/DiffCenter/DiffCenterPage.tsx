@@ -59,13 +59,13 @@ export default function DiffCenterPage() {
     {taskId ? <Alert className={styles.notice} type="info" showIcon message={`当前仅按 taskId 筛选：${taskId}`} /> : null}
     <main className={styles.mainContent}>
       {diffId ? <Button type="text" icon={<ArrowLeftOutlined />} onClick={backToList}>返回交付中心</Button> : null}
-      {diffId ? <section className={styles.selectedDetail}><DiffDetailPanel query={selectedQuery} projectId={projectId} onRefresh={() => void selectedQuery.refetch()} /></section> : null}
+      {diffId ? <section className={styles.selectedDetail}><DiffDetailPanel query={selectedQuery} projectId={projectId} onRefresh={async () => { await selectedQuery.refetch() }} /></section> : null}
       {!listQuery.isLoading && listQuery.hasNextPage ? <Button className={styles.loadMore} loading={listQuery.isFetchingNextPage} onClick={() => void listQuery.fetchNextPage()}>加载更多</Button> : null}
     </main>
   </div>
 }
 
-function DiffDetailPanel({ query, projectId, onRefresh }: { query: ReturnType<typeof useDiff>; projectId: string; onRefresh: () => void }) {
+function DiffDetailPanel({ query, projectId, onRefresh }: { query: ReturnType<typeof useDiff>; projectId: string; onRefresh: () => Promise<void> }) {
   const diff = query.data
   const taskQuery = useTask(projectId, diff?.taskId ?? '')
   // 最终 Diff 已生成时，审核权归 Task 级 DiffReviewBatch；单 Diff 页面只用于查看。
@@ -75,8 +75,18 @@ function DiffDetailPanel({ query, projectId, onRefresh }: { query: ReturnType<ty
     queryFn: () => githubApi.listProjectRepositories(projectId),
     enabled: Boolean(projectId),
   })
+  const [refreshing, setRefreshing] = useState(false)
+  async function refreshLatest() {
+    if (refreshing) return
+    setRefreshing(true)
+    try {
+      await Promise.all([onRefresh(), taskQuery.refetch(), batchQuery.refetch()])
+    } finally {
+      setRefreshing(false)
+    }
+  }
   if (query.isLoading) return <Card><Spin /></Card>
-  if (query.isError || !diff || diff.projectId !== projectId) return <Card><Result status={query.isError ? errorStatus(query.error) : '404'} title={query.isError ? errorTitle(query.error, 'Diff 详情') : 'Diff 不存在或不可见'} extra={<Button onClick={onRefresh}>刷新</Button>} /></Card>
+  if (query.isError || !diff || diff.projectId !== projectId) return <Card><Result status={query.isError ? errorStatus(query.error) : '404'} title={query.isError ? errorTitle(query.error, 'Diff 详情') : 'Diff 不存在或不可见'} extra={<Button loading={refreshing} disabled={refreshing} onClick={() => void refreshLatest()}>刷新</Button>} /></Card>
   const deliveryDisplay = taskDeliveryDisplay(batchQuery.data, diff)
   const cardTitle = (
     <span>
@@ -88,8 +98,8 @@ function DiffDetailPanel({ query, projectId, onRefresh }: { query: ReturnType<ty
     <Space direction="vertical" className={styles.detailContent}>
       <DetailFields diff={diff} task={taskQuery.data} repositories={repositoriesQuery.data ?? []} />
       <DiffFilesPanel projectId={projectId} diffId={diff.id} />
-      <DiffAcceptance diff={diff} projectId={projectId} task={taskQuery.data} batch={batchQuery.data} onRefresh={() => { onRefresh(); void batchQuery.refetch() }} batchState={batchQuery.isLoading ? 'loading' : batchQuery.data ? 'available' : 'unavailable'} />
-      <Text type="secondary">本页面仅完成 Diff 验收，不代表已合并 MR。</Text>
+      <DiffAcceptance diff={diff} projectId={projectId} task={taskQuery.data} batch={batchQuery.data} onRefresh={refreshLatest} refreshing={refreshing} batchState={batchQuery.isLoading ? 'loading' : batchQuery.data ? 'available' : 'unavailable'} />
+      <Text type="secondary">本页面负责 Diff 验收和代码交付，不代表 MR 已创建或已合并。</Text>
     </Space>
   </Card>
 }
@@ -175,30 +185,31 @@ function DetailFields({ diff, task, repositories }: { diff: DiffDetail; task?: T
   </div>
 }
 
-function DiffAcceptance({ diff, projectId, task, batch, onRefresh, batchState }: { diff: DiffDetail; projectId: string; task: Task | undefined; batch: DiffReviewBatch | undefined; onRefresh: () => void; batchState: 'loading' | 'available' | 'unavailable' }) {
+function DiffAcceptance({ diff, projectId, task, batch, onRefresh, refreshing, batchState }: { diff: DiffDetail; projectId: string; task: Task | undefined; batch: DiffReviewBatch | undefined; onRefresh: () => Promise<void>; refreshing: boolean; batchState: 'loading' | 'available' | 'unavailable' }) {
   const accept = useAcceptDiff(projectId)
   const reject = useRejectDiff(projectId)
   const [reason, setReason] = useState('')
   const pending = accept.isPending || reject.isPending
   const handleMutationError = (error: Error) => {
     if (errorCode(error) === 'DIFF_BATCH_REVIEW_REQUIRED') {
-      onRefresh()
+      void onRefresh()
       return
     }
-    if (error instanceof ApiError && error.status === 409) onRefresh()
+    if (error instanceof ApiError && error.status === 409) void onRefresh()
   }
   if (diff.status === 'SUPERSEDED') return <Alert type="info" showIcon message="已被后续修改取代" description="同一工作区已有更新的 Diff；当前 Diff 不可验收或拒绝。" />
   if (batchState === 'loading') return <Text type="secondary">正在确认最终 Diff 验收状态…</Text>
-  if (batchState === 'available' && batch) return <TaskDeliveryPanel projectId={projectId} task={task} batch={batch} onRefresh={onRefresh} />
+  if (batchState === 'available' && batch) return <TaskDeliveryPanel projectId={projectId} task={task} batch={batch} onRefresh={onRefresh} refreshing={refreshing} />
   if (diff.status !== 'PENDING_REVIEW') return <Text type="secondary">该 Diff 已处理，只读。</Text>
   return <Form layout="vertical" onFinish={() => { if (reason.trim()) reject.mutate({ diffId: diff.id, input: { reason: reason.trim() } }, { onError: handleMutationError }) }}>
     <Form.Item label="拒绝原因" required><Input.TextArea value={reason} onChange={(event) => setReason(event.target.value)} placeholder="请输入拒绝原因" disabled={pending} /></Form.Item>
     <Space wrap><Button aria-label="accept-diff" type="primary" icon={<CheckOutlined />} loading={accept.isPending} disabled={pending} onClick={() => { if (!window.confirm('确认验收此 Diff？')) return; accept.mutate(diff.id, { onError: handleMutationError }) }}>验收 Diff</Button><Button aria-label="reject-diff" danger htmlType="submit" icon={<CloseOutlined />} loading={reject.isPending} disabled={pending || !reason.trim()}>拒绝 Diff</Button></Space>
-    {accept.error || reject.error ? <Alert className={styles.mutationError} type="error" showIcon message={mutationError(accept.error ?? reject.error)} action={accept.error instanceof ApiError && accept.error.status === 409 || reject.error instanceof ApiError && reject.error.status === 409 ? <Button size="small" onClick={onRefresh}>刷新状态</Button> : undefined} /> : null}
+    {accept.error || reject.error ? <Alert className={styles.mutationError} type="error" showIcon message={mutationError(accept.error ?? reject.error)} action={accept.error instanceof ApiError && accept.error.status === 409 || reject.error instanceof ApiError && reject.error.status === 409 ? <Button size="small" loading={refreshing} disabled={refreshing} onClick={() => void onRefresh()}>刷新状态</Button> : undefined} /> : null}
   </Form>
 }
 
-function TaskDeliveryPanel({ projectId, task, batch, onRefresh }: { projectId: string; task: Task | undefined; batch: DiffReviewBatch; onRefresh: () => void }) {
+function TaskDeliveryPanel({ projectId, task, batch, onRefresh, refreshing }: { projectId: string; task: Task | undefined; batch: DiffReviewBatch; onRefresh: () => Promise<void>; refreshing: boolean }) {
+  const navigate = useNavigate()
   const confirm = useConfirmTaskDiffReview(projectId)
   const reject = useRejectTaskDiffReview(projectId)
   const retry = useRetryTaskDiffReviewDelivery(projectId)
@@ -208,21 +219,35 @@ function TaskDeliveryPanel({ projectId, task, batch, onRefresh }: { projectId: s
   const error = confirm.error ?? reject.error ?? retry.error
   const superseded = batch.reviewStatus === 'SUPERSEDED'
   const awaitingConfirmation = batch.reviewStatus === 'PENDING_CONFIRMATION'
-  const canConfirm = awaitingConfirmation && task?.capabilities?.canConfirmDiffReview === true
-  const canReject = awaitingConfirmation && task?.capabilities?.canRejectDiffReview === true
+  // 最终 Diff 批次已进入待确认时必须提供任务级确认入口。
+  // 旧 Task DTO 可能尚未返回该 capability；权限仍由 confirmDiffReview 接口最终校验。
+  const canConfirm = awaitingConfirmation
+  // 任务详情 capability 在交付状态切换中可能滞后；待确认批次统一给出两个任务级决策入口，
+  // 最终权限和状态判断由对应接口保证，避免前端把有效操作错误隐藏成“死按钮”。
+  const canReject = awaitingConfirmation
   const retryableDelivery = batch.reviewStatus === 'ACCEPTED' && (batch.deliveryStatus === 'FAILED' || batch.deliveryStatus === 'PARTIALLY_DELIVERED')
   const canRetry = !superseded && retryableDelivery && task?.capabilities?.canRetryDelivery === true
   const diffs = Array.isArray(batch.diffs) ? batch.diffs : []
   const repositories = Array.isArray(batch.repositoryDeliveries) ? batch.repositoryDeliveries : []
-  const statusMessage = taskDeliveryStatusMessage(batch, repositories)
+  const statusMessage = taskDeliveryStatusMessage(batch, repositories, task?.deliveryMode ?? null)
   const handleError = (mutationError: Error) => {
-    if (mutationError instanceof ApiError && (mutationError.status === 409 || errorCode(mutationError) === 'DIFF_DELIVERY_NOT_RETRYABLE')) onRefresh()
+    if (mutationError instanceof ApiError && (mutationError.status === 409 || errorCode(mutationError) === 'DIFF_DELIVERY_NOT_RETRYABLE')) void onRefresh()
   }
 
   return <Card size="small" title="任务级交付">
     <Space direction="vertical" size="small" className={styles.taskDeliveryPanel}>
       <Text type="secondary">最终交付批次：{diffs.length} 个 Diff · {repositories.length} 个仓库。</Text>
-      <Alert type={statusMessage.type} showIcon message={statusMessage.message} description={statusMessage.description} action={statusMessage.refreshable ? <Button size="small" onClick={onRefresh}>刷新最新状态</Button> : undefined} />
+      <Alert
+        type={statusMessage.type}
+        showIcon
+        message={statusMessage.message}
+        description={statusMessage.description}
+        action={statusMessage.refreshable ? (
+          <Button size="small" loading={refreshing} disabled={refreshing || pending} onClick={() => void onRefresh()}>刷新最新状态</Button>
+        ) : task?.deliveryMode === 'DIFF_FIRST' && batch.deliveryStatus === 'DELIVERED' ? (
+          <Button size="small" onClick={() => navigate(`${PATHS.projectTestset(projectId)}?tab=mr`)}>前往 MR 列表</Button>
+        ) : undefined}
+      />
       {canConfirm || canReject ? <Space wrap>
         {canConfirm ? <Button type="primary" loading={confirm.isPending} disabled={pending} onClick={() => confirm.mutate(batch.taskId, { onError: handleError })}>确认交付</Button> : null}
         {canReject ? <Button danger type="link" disabled={pending} onClick={() => setShowRejectForm((visible) => !visible)}>{showRejectForm ? '收起拒绝' : '拒绝交付'}</Button> : null}
@@ -232,7 +257,7 @@ function TaskDeliveryPanel({ projectId, task, batch, onRefresh }: { projectId: s
         <Space><Button onClick={() => setShowRejectForm(false)} disabled={pending}>取消</Button><Button danger type="primary" htmlType="submit" loading={reject.isPending} disabled={pending || !reason.trim()}>提交拒绝</Button></Space>
       </Form> : null}
       {canRetry ? <Button size="small" loading={retry.isPending} disabled={pending} onClick={() => retry.mutate(batch.taskId, { onError: handleError })}>重试交付</Button> : null}
-      {error ? <Alert type="error" showIcon message={taskDeliveryError(error)} action={error instanceof ApiError && error.status === 409 ? <Button size="small" onClick={onRefresh}>刷新</Button> : undefined} /> : null}
+      {error ? <Alert type="error" showIcon message={taskDeliveryError(error)} action={error instanceof ApiError && error.status === 409 ? <Button size="small" loading={refreshing} disabled={refreshing || pending} onClick={() => void onRefresh()}>刷新</Button> : undefined} /> : null}
     </Space>
   </Card>
 }
@@ -240,12 +265,34 @@ function TaskDeliveryPanel({ projectId, task, batch, onRefresh }: { projectId: s
 function taskDeliveryStatusMessage(
   batch: DiffReviewBatch,
   repositories: DiffReviewBatch['repositoryDeliveries'],
+  deliveryMode: Task['deliveryMode'],
 ): { type: 'info' | 'success' | 'warning' | 'error'; message: string; description: string; refreshable: boolean } {
   if (batch.reviewStatus === 'SUPERSEDED') return { type: 'warning', message: '该交付批次已被后续修改取代', description: '请刷新并查看最新 Diff，当前批次不能确认、拒绝或重试。', refreshable: true }
   if (batch.reviewStatus === 'REJECTED') return { type: 'error', message: '该任务交付已被拒绝', description: batch.reviewReason ? `拒绝原因：${batch.reviewReason}` : '需要生成新的最终 Diff 后再提交交付。', refreshable: false }
-  if (batch.reviewStatus === 'PENDING_CONFIRMATION') return { type: 'warning', message: '等待确认交付', description: '确认后将按仓库逐一创建提交或 MR。', refreshable: false }
-  if (batch.deliveryStatus === 'DELIVERED') return { type: 'success', message: '交付已完成', description: '所有仓库已完成交付，可继续查看对应 MR。', refreshable: false }
-  if (batch.deliveryStatus === 'DELIVERING') return { type: 'info', message: '正在交付', description: '后端正在按仓库创建提交或 MR，请稍候刷新状态。', refreshable: true }
+  if (batch.reviewStatus === 'PENDING_CONFIRMATION') {
+    const description = deliveryMode === 'MR_FIRST'
+      ? '确认后将按仓库提交代码，并自动进入 Dry Run 和 CQ+1 流程。'
+      : deliveryMode === 'DIFF_FIRST'
+        ? '确认后将按仓库提交代码；MR 需要在交付完成后由用户按需发起，不会自动执行 Dry Run 或 CQ+1。'
+        : '确认后将按仓库提交代码；后续 MR 流程以任务的交付模式为准。'
+    return { type: 'warning', message: '等待确认交付', description, refreshable: false }
+  }
+  if (batch.deliveryStatus === 'DELIVERED') {
+    const description = deliveryMode === 'DIFF_FIRST'
+      ? '所有仓库的代码提交已完成。你可以前往 MR 列表按需发起 MR；本流程不会自动执行 Dry Run 或 CQ+1。'
+      : deliveryMode === 'MR_FIRST'
+        ? '所有仓库的代码提交已完成，系统将继续进行 Dry Run 和 CQ+1；请前往 MR 列表查看后续状态。'
+        : '所有仓库的代码提交已完成；如任务需要创建 MR，请前往 MR 列表查看后续状态。'
+    return { type: 'success', message: '代码已交付', description, refreshable: false }
+  }
+  if (batch.deliveryStatus === 'DELIVERING') {
+    const description = deliveryMode === 'DIFF_FIRST'
+      ? '系统正在为各仓库提交代码。交付完成后可前往 MR 列表按需发起 MR，不会自动执行 Dry Run 或 CQ+1。'
+      : deliveryMode === 'MR_FIRST'
+        ? '系统正在为各仓库提交代码，完成后会自动进入 Dry Run 和 CQ+1 流程。请等待状态更新，无需重复提交。'
+        : '系统正在为各仓库提交代码，请等待处理完成后查看后续 MR 流程。无需重复提交。'
+    return { type: 'info', message: '代码交付处理中', description, refreshable: true }
+  }
   if (batch.deliveryStatus === 'FAILED' || batch.deliveryStatus === 'PARTIALLY_DELIVERED') {
     const failedRepositories = repositories.filter((repository) => repository.deliveryStatus === 'FAILED').map((repository) => repository.repositoryName)
     const scope = failedRepositories.length > 0 ? `失败仓库：${failedRepositories.join('、')}。` : '部分仓库尚未完成交付。'

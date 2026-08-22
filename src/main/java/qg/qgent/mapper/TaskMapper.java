@@ -1,6 +1,7 @@
 package qg.qgent.mapper;
 
 import com.baomidou.mybatisplus.core.mapper.BaseMapper;
+import org.apache.ibatis.annotations.Delete;
 import org.apache.ibatis.annotations.Mapper;
 import org.apache.ibatis.annotations.Param;
 import org.apache.ibatis.annotations.Select;
@@ -86,6 +87,15 @@ public interface TaskMapper extends BaseMapper<TaskEntity> {
     int failAfterStaleRun(@Param("projectId") UUID projectId, @Param("taskId") UUID taskId);
 
     /**
+     * MR 预检确认源分支与目标分支无差异时，收敛自动交付任务，避免补偿调度器永久重复申请预检。
+     */
+    @Update("update tasks set status='FAILED', failure_code='MR_NO_CHANGES', "
+            + "failure_reason='源分支与目标分支当前提交相同，没有可创建 MR 的变更', failure_retryable=0, "
+            + "failure_occurred_at=UTC_TIMESTAMP(6), updated_at=UTC_TIMESTAMP(6) where id=#{taskId} "
+            + "and project_id=#{projectId} and status in ('WAITING_PREFLIGHT','SUCCEEDED')")
+    int failMrPreflightNoChanges(@Param("projectId") UUID projectId, @Param("taskId") UUID taskId);
+
+    /**
      * 找出尚未创建活跃 Run、且关联 Workspace 当前没有有效写租约的 PENDING 任务。
      * 恢复器只发布续跑事件，实际认领仍由 claimForResume 的 CAS 完成。
      */
@@ -149,4 +159,23 @@ public interface TaskMapper extends BaseMapper<TaskEntity> {
             + "order by t.updated_at limit #{limit}")
     java.util.List<UUID> selectStaleOrphaned(@Param("staleBefore") java.time.LocalDateTime staleBefore,
                                              @Param("limit") int limit);
+
+    /**
+     * 解散团队时按项目逐层删除不再被任何任务引用的叶子任务。
+     * <p>
+     * tasks 存在自引用外键 {@code fk_task_continuation}（continuation_of_task_id -&gt; id）且无级联，
+     * 续跑链可多级；单条批量 DELETE 无法在同一语句内删除互相引用的父子行，须循环调用
+     * 本方法直至返回 0。续跑引用限定在相同项目内，保证逐层收敛。
+     * <p>
+     * MySQL 不允许在 DELETE 的 FROM/子查询中再次读取目标表（error 1093），因此把
+     * 「被引用的父行 id」子查询用派生表 {@code AS tmp} 包一层，让 MySQL 先物化；
+     * 同时用 {@code IS NOT NULL} 排除空值，避免 {@code NOT IN} 遇到 NULL 时整体失效。
+     *
+     * @param projectId 项目 ID
+     * @return 本次实际删除的行数；为 0 表示已无满足条件的任务
+     */
+    @Delete("delete from tasks where project_id = #{projectId} "
+            + "and id not in (select rid from (select continuation_of_task_id as rid from tasks "
+            + "where project_id = #{projectId} and continuation_of_task_id is not null) as tmp)")
+    int deleteUnreferencedTasks(@Param("projectId") UUID projectId);
 }

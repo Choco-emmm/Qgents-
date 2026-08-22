@@ -37,6 +37,7 @@ import type {
   ReplaceTaskStepAgentInput,
   PageFilters,
   TaskModelPage,
+  TaskMergeRequestPreflightList,
   TaskArtifact,
   DiffReviewBatch,
   MergeRequestCheck,
@@ -408,6 +409,18 @@ export function useRequestMergeRequestPreflight(
   })
 }
 
+/** 重新运行失败/CQ 拒绝的分支级预检。 */
+export function useRetryMergeRequestPreflight(
+  projectId: string,
+): UseMutationResult<MergeRequestPreflight, Error, string> {
+  return useMutation({
+    mutationFn: (preflightId) => mergeRequestsApi.retryPreflight(projectId, preflightId),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: taskModelQueryKeys.mergeRequests.all(projectId) })
+    },
+  })
+}
+
 /** 按 Task 查询预检状态（恢复已启动的预检进度） */
 export function useTaskMergeRequestPreflight(
   projectId: string,
@@ -433,6 +446,7 @@ export function useMergeRequests(
     queryKey: taskModelQueryKeys.mergeRequests.list(projectId, filters),
     queryFn: () => mergeRequestsApi.list(projectId, filters),
     enabled: Boolean(projectId) && (options?.enabled ?? true),
+    staleTime: 10_000,
     // 兼容"用户手动点创建 MR"和"后端 MrFirstAutomationService 自动创建 MR"两种链路：
     // - 手动创建 useCreateMergeRequest 会在 onSuccess 立即 invalidate 缓存 → 立即刷新
     // - 自动创建没有 SSE 推送前，用 10s 轻量轮询兜底，保证用户停在 MR 列表页时能很快看到新记录
@@ -507,9 +521,9 @@ export function useMergeRequestCommits(
 
 export function useMergeMergeRequest(
   projectId: string,
-): UseMutationResult<MergeRequestSummary, Error, string> {
+): UseMutationResult<MergeRequestSummary, Error, { mergeRequestId: string; commitMessage?: string }> {
   return useMutation({
-    mutationFn: (mergeRequestId) => mergeRequestsApi.merge(projectId, mergeRequestId),
+    mutationFn: ({ mergeRequestId, commitMessage }) => mergeRequestsApi.merge(projectId, mergeRequestId, commitMessage),
     onSuccess: (mr) => {
       rememberMergeRequest(projectId, mr)
     },

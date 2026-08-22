@@ -593,6 +593,10 @@ public class TestRunService {
             throw new ApiException(HttpStatus.CONFLICT, "TESTSET_DEFINITION_INVALID",
                     "Testset 定义缺失或仍使用旧格式，不能创建可恢复运行");
         }
+        if (!TestsetService.isSupportedExecutionCommand(command)) {
+            throw new ApiException(HttpStatus.CONFLICT, "TESTSET_DEFINITION_INVALID",
+                    "Testset 命令不受支持，不能创建可恢复运行");
+        }
         Map<String, Object> rule = (Map<String, Object>) rawRule;
         if (!"EXIT_CODE".equals(String.valueOf(rule.get("type"))) || !(rule.get("expected") instanceof Number)) {
             throw new ApiException(HttpStatus.CONFLICT, "TESTSET_DEFINITION_INVALID", "Testset 通过规则无效");
@@ -671,7 +675,8 @@ public class TestRunService {
 
     private TestRunResponse toTestRun(TestRunEntity run) {
         return new TestRunResponse(id(run.getId()), id(run.getProjectId()), id(run.getProjectRepositoryId()),
-                run.getRef(), run.getTestsetIds(), run.getStatus(), run.getSummary(),
+                id(run.getTaskId()), run.getRef() == null ? run.getExecutionSourceRef() : run.getRef(),
+                run.getTestsetIds(), run.getStatus(), run.getSummary(),
                 id(run.getCreatedBy()), iso(run.getCreatedAt()),
                 iso(run.getStartedAt()), iso(run.getFinishedAt()), iso(run.getUpdatedAt()), durationMs(run));
     }

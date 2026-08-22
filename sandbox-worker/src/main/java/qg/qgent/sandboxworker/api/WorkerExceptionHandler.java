@@ -10,6 +10,9 @@ import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
 import jakarta.validation.ConstraintViolationException;
+import jakarta.servlet.http.HttpServletRequest;
+
+import java.util.stream.Collectors;
 
 /**
  * 将工作节点异常转换为稳定且不泄露内部信息的响应。
@@ -28,13 +31,29 @@ public class WorkerExceptionHandler {
     }
 
     @ExceptionHandler(MethodArgumentNotValidException.class)
-    public ResponseEntity<WorkerErrorResponse> handleValidationException() {
-        return ResponseEntity.badRequest().body(new WorkerErrorResponse("INVALID_REQUEST", "请求参数不合法"));
+    public ResponseEntity<WorkerErrorResponse> handleValidationException(MethodArgumentNotValidException exception) {
+        String fields = exception.getBindingResult().getFieldErrors().stream()
+                .map(error -> error.getField() + ":" + error.getDefaultMessage())
+                .distinct()
+                .collect(Collectors.joining(","));
+        log.warn("sandbox worker rejected request, invalid fields: {}", fields);
+        return ResponseEntity.badRequest()
+                .body(new WorkerErrorResponse("INVALID_REQUEST", validationMessage(fields)));
     }
 
     @ExceptionHandler(ConstraintViolationException.class)
-    public ResponseEntity<WorkerErrorResponse> handleConstraintViolation() {
-        return ResponseEntity.badRequest().body(new WorkerErrorResponse("INVALID_REQUEST", "请求参数不合法"));
+    public ResponseEntity<WorkerErrorResponse> handleConstraintViolation(ConstraintViolationException exception) {
+        String fields = exception.getConstraintViolations().stream()
+                .map(error -> error.getPropertyPath() + ":" + error.getMessage())
+                .distinct()
+                .collect(Collectors.joining(","));
+        log.warn("sandbox worker rejected request, constraint violations: {}", fields);
+        return ResponseEntity.badRequest()
+                .body(new WorkerErrorResponse("INVALID_REQUEST", validationMessage(fields)));
+    }
+
+    private String validationMessage(String fields) {
+        return fields == null || fields.isBlank() ? "请求参数不合法" : "请求参数不合法: " + fields;
     }
 
     /**
@@ -89,5 +108,29 @@ public class WorkerExceptionHandler {
     @ExceptionHandler(org.springframework.web.servlet.resource.NoResourceFoundException.class)
     public ResponseEntity<WorkerErrorResponse> handleNoResourceFound(org.springframework.web.servlet.resource.NoResourceFoundException exception) {
         return ResponseEntity.status(404).body(new WorkerErrorResponse("NOT_FOUND", "接口路径不存在"));
+    }
+
+    /**
+     * Controller 内未预期异常的最后兜底。响应只返回稳定的脱敏错误契约，日志记录脱敏后的
+     * 异常类型和摘要，避免主后端收到 Spring 默认错误体后只能显示无意义的通用文案。
+     */
+    @ExceptionHandler(Exception.class)
+    public ResponseEntity<WorkerErrorResponse> handleUnexpected(Exception exception, HttpServletRequest request) {
+        log.error("sandbox worker unexpected exception method={} uri={} exceptionType={} message={}",
+                request.getMethod(), request.getRequestURI(), exception.getClass().getName(),
+                sanitizeExceptionMessage(exception.getMessage()));
+        return ResponseEntity.status(500)
+                .body(new WorkerErrorResponse("WORKER_INTERNAL_ERROR", "Worker 内部错误"));
+    }
+
+    private String sanitizeExceptionMessage(String value) {
+        if (value == null || value.isBlank()) {
+            return "";
+        }
+        String sanitized = value.replaceAll("(?i)Bearer\\s+[^\\s]+", "Bearer [redacted]")
+                .replaceAll("(?i)(token|secret|password|authorization|api[_-]?key)\\s*[=:]\\s*[^\\s]+",
+                        "$1=[redacted]")
+                .replaceAll("[\\r\\n]+", " ").strip();
+        return sanitized.length() <= 500 ? sanitized : sanitized.substring(0, 497) + "...";
     }
 }
